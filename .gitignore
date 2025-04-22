@@ -1,0 +1,31 @@
+# misc
+.DS_Store
+*.pem
+untracked
+
+# logs
+**/logs
+logs
+**/*.log
+
+# local env files
+.env
+.env.*
+
+# Visual Studio Code
+.vscode
+.history
+
+# Jetbrains
+.idea
+
+# Python
+__pycache__
+**/venv
+**/.venv
+
+# Deleted files
+.fuse_hidden*
+
+# config.json - this should be only used locally and not added to VCS
+**/config.json

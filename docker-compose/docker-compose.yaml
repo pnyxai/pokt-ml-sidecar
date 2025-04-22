@@ -1,0 +1,32 @@
+x-base: &base
+  restart: unless-stopped
+  extra_hosts:
+    # this allows containers to call a port on the docker host machine
+    # instead of localhost (because that will be container) use host.docker.internal
+    # to resolve the docker host IP dynamically
+    host.docker.internal: host-gateway
+  logging:
+    options:
+      mode: non-blocking
+      max-size: "10m"
+      max-file: "3"
+
+
+services:
+  sidecar:
+    <<: *base
+    build:
+      context: ../../
+      dockerfile: apps/python/sidecar/Dockerfile
+    image: pocket_ml_sidecar:dev
+    deploy:
+      replicas: 1
+    environment:
+      CONFIG_PATH: /home/app/configs/config.json
+      HF_TOKEN: $HF_TOKEN
+    volumes:
+      - $SIDECAR_CONFIG_FILE:/home/app/configs/config.json
+      - $SIDECAR_TOKENIZER_FILE:/tokenizer/
+    ports:
+      - "9900:8000"
+
