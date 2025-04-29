@@ -1,4 +1,4 @@
-DEFAULT_IMAGE_NAME="pocket_ml_sidecar"
+DEFAULT_IMAGE_NAME="pokt_ml_sidecar"
 
 # go to root directory
 cd ../../..

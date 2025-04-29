@@ -109,7 +109,7 @@ def get_config_hash():
 @app.post("/v1/completions")
 async def override_v1_completitions(request: Request):
     logger.debug("overriding /v1/completions")
-    if LLM_BACKEND_ENDPOINT is None:
+    if LLM_BACKEND_MODEL_NAME is None:
         raise HTTPException(
             status_code=501, detail="Backend LLM overriding is not configured."
         )
@@ -136,7 +136,7 @@ async def override_v1_completitions(request: Request):
 @app.post("/v1/chat/completions")
 async def override_v1_chat_completitions(request: Request):
     logger.debug("overriding /v1/chat/completions")
-    if LLM_BACKEND_ENDPOINT is None:
+    if LLM_BACKEND_MODEL_NAME is None:
         raise HTTPException(
             status_code=501, detail="Backend LLM overriding is not configured."
         )
