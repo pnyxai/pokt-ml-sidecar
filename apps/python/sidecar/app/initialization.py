@@ -80,6 +80,7 @@ async def setup_llm_backend_override(endpoint_override_data, logger):
         LLM_BACKEND_MODEL_NAME = endpoint_override_data["backend_model_name"]
 
         if LLM_BACKEND_MODEL_NAME is None or LLM_BACKEND_MODEL_NAME == "None":
+            LLM_BACKEND_MODEL_NAME = None
             logger.info("LLM backend overriding not configured.")
             return LLM_BACKEND_ENDPOINT, LLM_BACKEND_MODEL_NAME
             
