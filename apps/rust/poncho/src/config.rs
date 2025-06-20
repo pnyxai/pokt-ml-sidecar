@@ -23,11 +23,18 @@ pub struct RoutingConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct ModelConfig {
+    pub model_public_name: String,
+    pub max_position_embeddings: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     pub log_level: String,
     pub server: ServerConfig,
     pub vllm_backend: VllmProxyConfig,
     pub routing: RoutingConfig,
+    pub model_config_data: ModelConfig,
 }
 
 impl Config {

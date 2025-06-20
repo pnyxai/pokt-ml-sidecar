@@ -1,4 +1,5 @@
 mod config;
+mod pocket;
 mod proxy;
 
 use axum::{routing::any, Router};
@@ -8,6 +9,8 @@ use std::{sync::Arc, time::Duration};
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 
 use config::Config;
+use pocket::PoktModelData;
+use pocket::PoktState;
 use proxy::ProxyState;
 use proxy::VllmOverrides;
 
@@ -39,6 +42,10 @@ async fn main() {
             model_name: config.vllm_backend.model_name_override,
             allow_logprobs: config.vllm_backend.allow_logprobs,
         },
+        PoktModelData {
+            max_position_embeddings: config.model_config_data.max_position_embeddings,
+            model_public_name: config.model_config_data.model_public_name,
+        },
     )
     .await;
 }
@@ -51,6 +58,7 @@ async fn run_server(
     tcp_timeout: u64,
     max_payload_size_mb: usize,
     vllm_overrides: VllmOverrides,
+    model_config: PoktModelData,
 ) {
     // Simple HTTP1 client
     let client = Client::builder()
@@ -72,7 +80,7 @@ async fn run_server(
     // Wrap the HTTP client and other needed data in an
     // Arc (atomic reference counter) so it can be safely shared across
     // multiple async tasks
-    let state = Arc::new(ProxyState {
+    let porxy_state = Arc::new(ProxyState {
         client,
         backend_url: backend_addr,
         backend_port: backend_port,
@@ -81,8 +89,18 @@ async fn run_server(
         vllm_overrides: vllm_overrides,
     });
 
+    let pokt_state = Arc::new(PoktState {
+        model_data: model_config,
+    });
+
+    // Build the router for the pokt endpoints
+    let pokt_router = Router::new()
+        .route("/*path", any(pocket::pokt_handler))
+        .with_state(pokt_state);
+
     // Sets up the web application routing:
     let app = Router::new()
+        .nest("/pokt", pokt_router)
         // Catches all paths and HTTP methods, routing them to proxy_handler
         .route("/*path", any(proxy::proxy_handler))
         // Allows cross-origin requests from any domain
@@ -92,7 +110,7 @@ async fn run_server(
             max_payload_size_mb * 1024 * 1024,
         ))
         // Makes the shared client available to handlers
-        .with_state(state);
+        .with_state(porxy_state);
 
     // Bind the server to the provided address
     // let listener = tokio::net::TcpListener::bind(format!("{}:{}", server_addr, server_port))
