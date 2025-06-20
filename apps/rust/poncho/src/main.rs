@@ -8,13 +8,11 @@ use axum::{
     routing::any,
     Router,
 };
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use tokio_stream::StreamExt;
-use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 
 use config::Config;
@@ -51,6 +49,7 @@ async fn main() {
     .await;
 }
 
+#[derive(Clone)]
 struct VllmOverrides {
     model_name: String,
     allow_logprobs: bool,
@@ -82,12 +81,16 @@ async fn run_server(
         // Panics if the server fails to start
         .expect("Failed to create HTTP client");
 
-    // Wrap the HTTP client in an Arc (atomic reference counter) so it can be safely shared across multiple async tasks
+    // Wrap the HTTP client and other needed data in an
+    // Arc (atomic reference counter) so it can be safely shared across
+    // multiple async tasks
     let state = Arc::new(ProxyState {
         client,
         backend_url: backend_addr,
         backend_port: backend_port,
         max_payload_size_mb: max_payload_size_mb,
+        timeout: tcp_timeout + 10, // 10 more seconds
+        vllm_overrides: vllm_overrides,
     });
 
     // Sets up the web application routing:
@@ -104,6 +107,7 @@ async fn run_server(
         .with_state(state);
 
     // Bind the server to the provided address
+    // let listener = tokio::net::TcpListener::bind(format!("{}:{}", server_addr, server_port))
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", server_addr, server_port))
         .await
         // Panics if the server fails to start
@@ -139,6 +143,8 @@ struct ProxyState {
     backend_url: String,
     backend_port: String,
     max_payload_size_mb: usize,
+    timeout: u64,
+    vllm_overrides: VllmOverrides,
 }
 
 async fn proxy_handler(
@@ -150,7 +156,7 @@ async fn proxy_handler(
     body: Body,
 ) -> Result<Response, ProxyError> {
     // Set the backend target endpoint
-    let target_base = format!("{}:{}", state.backend_url, state.backend_port);
+    let target_base = format!("http://{}:{}", state.backend_url, state.backend_port);
     // Append the target path
     let target_url = format!("{}/{}", target_base, path);
 
@@ -197,7 +203,7 @@ async fn proxy_handler(
     // If so, and there is some body here, modify it
     let processed_body = if should_modify && !body_bytes.is_empty() {
         debug!("🔧 Modifying request body...");
-        match modify_json_payload(body_bytes) {
+        match modify_json_payload(body_bytes, state.vllm_overrides.clone()) {
             Ok(modified) => {
                 debug!("✅ Body modified successfully");
                 modified
@@ -211,35 +217,9 @@ async fn proxy_handler(
         body_bytes
     };
 
-    // Prepare headers - only essential ones like curl
+    // Prepare headers
     debug!("📋 Preparing headers...");
     let mut upstream_headers = reqwest::header::HeaderMap::new();
-
-    // Add only essential headers that curl sends
-    upstream_headers.insert(
-        reqwest::header::HOST,
-        reqwest::header::HeaderValue::from_str(&format!(
-            "{}:{}",
-            target_base
-                .strip_prefix("http://")
-                .unwrap_or(&target_base)
-                .split(':')
-                .next()
-                .unwrap_or("localhost"),
-            target_base.split(':').last().unwrap_or("9087")
-        ))
-        .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("localhost:9087")),
-    );
-
-    upstream_headers.insert(
-        reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static("axum-proxy/1.0"),
-    );
-
-    upstream_headers.insert(
-        reqwest::header::ACCEPT,
-        reqwest::header::HeaderValue::from_static("*/*"),
-    );
 
     // Only add content-type if we have a body
     if !processed_body.is_empty() {
@@ -261,35 +241,39 @@ async fn proxy_handler(
     for (name, value) in upstream_headers.iter() {
         debug!("   {}: {}", name, value.to_str().unwrap_or("[unprintable]"));
     }
-
     debug!("🚀 Making upstream request...");
     debug!("   URL: {}", full_url);
     debug!("   Method: {}", method);
     debug!("   Body size: {} bytes", processed_body.len());
 
-    // Build request exactly like curl does
+    // Build request
     let request_builder = state
+        // set client
         .client
+        // add method and endpoint
         .request(method.clone(), &full_url)
+        // add headers
         .headers(upstream_headers)
-        .body(processed_body); // Always set body, even if empty
+        // add body
+        .body(processed_body);
 
     debug!("⏳ Sending request to vLLM...");
     debug!("🔍 About to call request_builder.send()...");
 
     // Add a timeout wrapper to catch hanging requests
     let request_future = request_builder.send();
-    let timeout_duration = Duration::from_secs(10); // Even shorter timeout
+    let timeout_duration = Duration::from_secs(state.timeout);
 
     debug!(
         "⏰ Starting request with {} second timeout...",
         timeout_duration.as_secs()
     );
 
+    // Await the request future
     let upstream_response = match tokio::time::timeout(timeout_duration, request_future).await {
         Ok(Ok(response)) => {
             debug!(
-                "✅ Got response from vLLM: {} - Headers: {:?}",
+                "✅ Got response from backend: {} - Headers: {:?}",
                 response.status(),
                 response.headers()
             );
@@ -309,7 +293,7 @@ async fn proxy_handler(
                 )));
             } else if e.is_connect() {
                 return Err(ProxyError::Upstream(format!(
-                    "Connection failed to {}: {} - Check if vLLM server is running",
+                    "Connection failed to {}: {} - Check if backend vLLM server is running",
                     full_url, e
                 )));
             } else if e.is_request() {
@@ -326,7 +310,7 @@ async fn proxy_handler(
         }
         Err(_) => {
             error!(
-                "❌ Request timed out after {} seconds - this suggests the request is hanging",
+                "❌ Request timed out after {} seconds",
                 timeout_duration.as_secs()
             );
             return Err(ProxyError::Upstream(format!(
@@ -337,7 +321,7 @@ async fn proxy_handler(
         }
     };
 
-    // Check if streaming
+    // Check if it is a streaming request
     let is_streaming = upstream_response
         .headers()
         .get("content-type")
@@ -355,8 +339,10 @@ async fn proxy_handler(
     );
 
     if is_streaming {
+        // Handle a streaming response
         handle_streaming_response(upstream_response).await
     } else {
+        // Handle a regular response
         handle_regular_response(upstream_response).await
     }
 }
@@ -376,8 +362,8 @@ fn should_modify_request(method: &Method, path: &str, headers: &HeaderMap) -> bo
 }
 
 /// Modifies the json payload of a vllm request, overridingthe model name and
-/// returning a flag if the body requested any banned feature (like "logprobs")
-fn modify_json_payload(body: Bytes) -> Result<Bytes, ProxyError> {
+/// raising an error if logprobs are requested but not allowed
+fn modify_json_payload(body: Bytes, vllm_overrides: VllmOverrides) -> Result<Bytes, ProxyError> {
     // just in case empty body check
     if body.is_empty() {
         return Ok(body);
@@ -390,25 +376,20 @@ fn modify_json_payload(body: Bytes) -> Result<Bytes, ProxyError> {
     // if we can get a mutable jsojn hashmap, go ahead
     if let Some(obj) = json.as_object_mut() {
         // Model override
-        if let Ok(model_override) = std::env::var("MODEL_OVERRIDE") {
-            if obj.contains_key("model") {
-                obj.insert("model".to_string(), Value::String(model_override));
-            }
+        if obj.contains_key("model") {
+            obj.insert(
+                "model".to_string(),
+                Value::String(vllm_overrides.model_name),
+            );
         }
 
         // Check for logprobs
-        if obj.contains_key("logprobs") || obj.contains_key("prompt_logprobs") {}
-
-        // Max tokens limits
-        if let Some(max_tokens) = obj.get("max_tokens") {
-            if let Some(tokens_val) = max_tokens.as_u64() {
-                let max_allowed = std::env::var("MAX_TOKENS_LIMIT")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(4096);
-                let clamped_tokens = tokens_val.min(max_allowed);
-                obj.insert("max_tokens".to_string(), Value::from(clamped_tokens));
-            }
+        if (obj.contains_key("logprobs") || obj.contains_key("prompt_logprobs"))
+            && !vllm_overrides.allow_logprobs
+        {
+            return Err(ProxyError::Validation(
+                "logprobs parameter is not allowed must be omitted".to_string(),
+            ));
         }
 
         debug!("🔧 Modified JSON payload");
@@ -420,6 +401,7 @@ fn modify_json_payload(body: Bytes) -> Result<Bytes, ProxyError> {
     Ok(Bytes::from(modified_json))
 }
 
+/// Stream response handler, will send the proxied request response as it arrives
 async fn handle_streaming_response(
     upstream_response: reqwest::Response,
 ) -> Result<Response, ProxyError> {
@@ -467,6 +449,8 @@ async fn handle_streaming_response(
         .map_err(|e| ProxyError::Internal(format!("Failed to build streaming response: {}", e)))
 }
 
+/// Regular response handler, will receive the response and then send it back to
+/// the proxied source
 async fn handle_regular_response(
     upstream_response: reqwest::Response,
 ) -> Result<Response, ProxyError> {
@@ -506,22 +490,6 @@ async fn handle_regular_response(
         .map_err(|e| ProxyError::Internal(format!("Failed to build regular response: {}", e)))
 }
 
-#[inline]
-fn should_forward_header(header_name: &str) -> bool {
-    !matches!(
-        header_name.to_ascii_lowercase().as_str(),
-        "host"
-            | "connection"
-            | "upgrade"
-            | "proxy-connection"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailers"
-            | "transfer-encoding"
-    )
-}
-
 async fn shutdown_signal() {
     use tokio::signal;
 
@@ -555,6 +523,7 @@ enum ProxyError {
     Internal(String),
     Upstream(String),
     Json(String),
+    Validation(String),
 }
 
 impl IntoResponse for ProxyError {
@@ -570,6 +539,10 @@ impl IntoResponse for ProxyError {
             }
             ProxyError::Json(msg) => {
                 error!("❌ JSON error: {}", msg);
+                (StatusCode::BAD_REQUEST, msg)
+            }
+            ProxyError::Validation(msg) => {
+                error!("❌ Validation error: {}", msg);
                 (StatusCode::BAD_REQUEST, msg)
             }
         };
