@@ -1,7 +1,4 @@
-# pokt-ml-sidecar
-Sidecar for running ML services on the Pocket Network
-
-### Poncho 
+# Poncho - A sidecar for ML in the Pocket Network
 
 The poncho is a performant Rust app that is designed to cover your vLLM endpoint and keep it warm and cozy doing its stuff while it connects to the POKT Network.
 Currently it supports:
