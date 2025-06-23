@@ -7,6 +7,7 @@ Currently it supports:
     - `/pokt/config-hash` : Returns the config hash (TODO).
     - `/pokt/tokenizer` : Provides the model tokenizer (TODO)
     - `/pokt/tokenizer-hash` : Returns the tokenizer hash (TODO).
-- Model name overriding on requests: The POKT Network will send requests for the model `pocket_network`, if your model is not deployed under this name, you will need to override that request and replace it with your real model name.
+- Model name overriding on requests: The POKT Network will send requests for the model `pocket_network`, we take care of overriding this to match the actual backend model name.
+- Model name overriding on responses: The model name shown in the response will match the one advertised to POKT (`pocket_network`).
 - Logprobs limitation:  Sometimes you don't want (or cant) provide "logprobs" to your generations, so we can block any request that includes `logprobs` as parameter.
 - Tokens to generate limitation: You may want to limit the amount of tokens to generate to keep the backend working at a given load. This will replace the `max_tokens` parameters to allow up to `config/max_position_embeddings` tokens to generate (TODO : Improve this to account for context).
