@@ -14,6 +14,7 @@ use tokio_stream::StreamExt;
 pub struct VllmOverrides {
     pub model_name: String,
     pub allow_logprobs: bool,
+    pub max_tokens: u64,
 }
 
 // In web servers, each incoming request is handled by a separate async task.
@@ -71,7 +72,7 @@ pub async fn proxy_handler(
     body: Body,
 ) -> Result<Response, ProxyError> {
     // Set the backend target endpoint
-    let target_base = format!("http://{}:{}", state.backend_url, state.backend_port);
+    let target_base = format!("{}:{}", state.backend_url, state.backend_port);
     // Append the target path
     let target_url = format!("{}/{}", target_base, path);
 
@@ -305,6 +306,19 @@ fn modify_json_payload(body: Bytes, vllm_overrides: VllmOverrides) -> Result<Byt
             return Err(ProxyError::Validation(
                 "logprobs parameter is not allowed must be omitted".to_string(),
             ));
+        }
+
+        // Check for max_tokens
+        if let Some(max_tokens) = obj.get("max_tokens") {
+            if let Some(max_tokens_val) = max_tokens.as_u64() {
+                if max_tokens_val > vllm_overrides.max_tokens {
+                    // TODO : Account for context
+                    obj.insert(
+                        "max_tokens".to_string(),
+                        Value::from(vllm_overrides.max_tokens),
+                    );
+                }
+            }
         }
 
         debug!("🔧 Modified JSON payload");

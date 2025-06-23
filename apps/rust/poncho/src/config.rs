@@ -25,7 +25,7 @@ pub struct RoutingConfig {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ModelConfig {
     pub model_public_name: String,
-    pub max_position_embeddings: String,
+    pub max_position_embeddings: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

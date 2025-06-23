@@ -30,3 +30,18 @@ services:
     ports:
       - "9900:8000"
 
+  poncho:
+    <<: *base
+    build:
+      context: ../../
+      dockerfile: apps/rust/poncho/Dockerfile
+    image: pokt_ml_poncho:dev
+    deploy:
+      replicas: 1
+    environment:
+      CONFIG_PATH: /config/config.yaml
+    volumes:
+      - $PONCHO_CONFIG_FILE:/config/config.yaml
+    ports:
+      - "9901:8080"
+

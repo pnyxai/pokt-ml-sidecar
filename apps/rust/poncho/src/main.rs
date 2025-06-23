@@ -41,9 +41,10 @@ async fn main() {
         VllmOverrides {
             model_name: config.vllm_backend.model_name_override,
             allow_logprobs: config.vllm_backend.allow_logprobs,
+            max_tokens: config.model_config_data.max_position_embeddings,
         },
         PoktModelData {
-            max_position_embeddings: config.model_config_data.max_position_embeddings,
+            max_position_embeddings: config.model_config_data.max_position_embeddings.to_string(),
             model_public_name: config.model_config_data.model_public_name,
         },
     )
