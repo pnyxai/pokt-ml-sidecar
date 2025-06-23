@@ -174,7 +174,7 @@ pub async fn proxy_handler(
         // add body
         .body(processed_body);
 
-    debug!("⏳ Sending request to vLLM...");
+    debug!("⏳ Sending request to backend...");
     debug!("🔍 About to call request_builder.send()...");
 
     // Add a timeout wrapper to catch hanging requests
@@ -210,7 +210,7 @@ pub async fn proxy_handler(
                 )));
             } else if e.is_connect() {
                 return Err(ProxyError::Upstream(format!(
-                    "Connection failed to {}: {} - Check if backend vLLM server is running",
+                    "Connection failed to {}: {} - Check if backend server is running",
                     full_url, e
                 )));
             } else if e.is_request() {
@@ -277,7 +277,7 @@ fn should_modify_request(method: &Method, path: &str, headers: &HeaderMap) -> bo
     // If the method is POST
     method == Method::POST
         // if the path is either a completions or chat completions
-        && (path.contains("completions") || path.contains("chat"))
+        && path.contains("completions")
         // and if the content type is application/json
         && headers
             .get("content-type")
@@ -438,7 +438,7 @@ fn modify_json_chunk(
 
         Ok(Bytes::from(sse_chunk))
     } else {
-        // Not SSE format, probably not vLLM, do not modify
+        // Not SSE format, probably not OpenAI, do not modify
         return Ok(chunk.clone());
     }
 }
