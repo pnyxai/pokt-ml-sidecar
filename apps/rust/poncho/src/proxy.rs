@@ -264,7 +264,11 @@ pub async fn proxy_handler(
         .await
     } else {
         // Handle a regular response
-        handle_regular_response(upstream_response).await
+        handle_regular_response(
+            upstream_response,
+            state.vllm_overrides.overriden_name.clone(),
+        )
+        .await
     }
 }
 
@@ -294,7 +298,7 @@ fn modify_json_payload(body: Bytes, vllm_overrides: VllmOverrides) -> Result<Byt
     let mut json: Value = serde_json::from_slice(&body)
         .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
 
-    // if we can get a mutable jsojn hashmap, go ahead
+    // if we can get a mutable json hashmap, go ahead
     if let Some(obj) = json.as_object_mut() {
         // Model override
         if obj.contains_key("model") {
@@ -443,6 +447,7 @@ fn modify_json_chunk(
 /// the proxied source
 async fn handle_regular_response(
     upstream_response: reqwest::Response,
+    new_model_name: String,
 ) -> Result<Response, ProxyError> {
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
@@ -456,6 +461,24 @@ async fn handle_regular_response(
 
     debug!("📥 Response body: {} bytes", body_bytes.len());
 
+    // Override model name
+    // Read all the body as a json, it should be a json
+    let mut json: Value = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
+    if let Some(obj) = json.as_object_mut() {
+        // Model override
+        if obj.contains_key("model") {
+            obj.insert("model".to_string(), Value::String(new_model_name));
+        }
+    }
+    let modified_json = serde_json::to_vec(&json)
+        .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
+    let modified_body_bytes = Bytes::from(modified_json);
+    debug!(
+        "✏️ Modified JSON regular response: {} bytes",
+        modified_body_bytes.len()
+    );
+
     // Copy headers
     let mut response_headers = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers.iter() {
@@ -463,7 +486,16 @@ async fn handle_regular_response(
             HeaderName::from_str(name.as_str()),
             HeaderValue::from_bytes(value.as_bytes()),
         ) {
-            response_headers.insert(name, value);
+            if name.as_str() == "content-length" {
+                // Replace context len with valid value
+                if let Ok(value) =
+                    HeaderValue::from_str(format!("{}", modified_body_bytes.len()).as_str())
+                {
+                    response_headers.insert(name, value);
+                }
+            } else {
+                response_headers.insert(name, value);
+            }
         }
     }
 
@@ -476,6 +508,6 @@ async fn handle_regular_response(
     debug!("✅ Regular response built successfully");
 
     response
-        .body(Body::from(body_bytes))
+        .body(Body::from(modified_body_bytes))
         .map_err(|e| ProxyError::Internal(format!("Failed to build regular response: {}", e)))
 }
