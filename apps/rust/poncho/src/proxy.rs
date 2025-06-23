@@ -15,6 +15,7 @@ pub struct VllmOverrides {
     pub model_name: String,
     pub allow_logprobs: bool,
     pub max_tokens: u64,
+    pub overriden_name: String,
 }
 
 // In web servers, each incoming request is handled by a separate async task.
@@ -256,7 +257,11 @@ pub async fn proxy_handler(
 
     if is_streaming {
         // Handle a streaming response
-        handle_streaming_response(upstream_response).await
+        handle_streaming_response(
+            upstream_response,
+            state.vllm_overrides.overriden_name.clone(),
+        )
+        .await
     } else {
         // Handle a regular response
         handle_regular_response(upstream_response).await
@@ -333,6 +338,7 @@ fn modify_json_payload(body: Bytes, vllm_overrides: VllmOverrides) -> Result<Byt
 /// Stream response handler, will send the proxied request response as it arrives
 async fn handle_streaming_response(
     upstream_response: reqwest::Response,
+    new_model_name: String,
 ) -> Result<Response, ProxyError> {
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
@@ -352,14 +358,29 @@ async fn handle_streaming_response(
 
     // Create stream
     let stream = upstream_response.bytes_stream();
-    let body_stream = stream.map(|chunk_result| match chunk_result {
-        Ok(chunk) => {
-            debug!("📦 Streaming chunk: {} bytes", chunk.len());
-            Ok(chunk)
-        }
-        Err(e) => {
-            error!("❌ Stream error: {}", e);
-            Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+    let body_stream = stream.map(move |chunk_result| {
+        match chunk_result {
+            Ok(chunk) => {
+                debug!("📦 Streaming chunk: {} bytes", chunk.len());
+
+                // Try to parse and modify the JSON chunk
+                match modify_json_chunk(&chunk, &new_model_name) {
+                    Ok(modified_chunk) => {
+                        debug!("✏️ Modified JSON chunk: {} bytes", modified_chunk.len());
+                        Ok(modified_chunk)
+                    }
+                    Err(e) => {
+                        // If parsing fails, pass through original chunk
+                        // This handles cases where chunk might not be complete JSON
+                        debug!("⚠️ Failed to parse chunk as JSON (passing through): {}", e);
+                        Ok(chunk)
+                    }
+                }
+            }
+            Err(e) => {
+                error!("❌ Stream error: {}", e);
+                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+            }
         }
     });
 
@@ -376,6 +397,46 @@ async fn handle_streaming_response(
     response
         .body(body)
         .map_err(|e| ProxyError::Internal(format!("Failed to build streaming response: {}", e)))
+}
+
+/// Modify the model field in a JSON chunk
+fn modify_json_chunk(
+    chunk: &Bytes,
+    new_model_name: &str,
+) -> Result<Bytes, Box<dyn std::error::Error>> {
+    let chunk_str = std::str::from_utf8(chunk)?;
+
+    // Handle SSE format: "data: {json}\n\n"
+    if chunk_str.starts_with("data: ") {
+        let json_part = &chunk_str[6..]; // Skip "data: "
+        let json_part = json_part.trim_end(); // Remove trailing whitespace/newlines
+
+        if json_part == "[DONE]" {
+            // Pass through completion marker
+            return Ok(chunk.clone());
+        }
+
+        // Parse and modify JSON
+        let mut json: Value = serde_json::from_str(json_part)?;
+
+        if let Some(obj) = json.as_object_mut() {
+            if obj.contains_key("model") {
+                obj.insert(
+                    "model".to_string(),
+                    Value::String(new_model_name.to_string()),
+                );
+            }
+        }
+
+        // Reconstruct SSE format
+        let modified_json = serde_json::to_string(&json)?;
+        let sse_chunk = format!("data: {}\n\n", modified_json);
+
+        Ok(Bytes::from(sse_chunk))
+    } else {
+        // Not SSE format, probably not vLLM, do not modify
+        return Ok(chunk.clone());
+    }
 }
 
 /// Regular response handler, will receive the response and then send it back to
