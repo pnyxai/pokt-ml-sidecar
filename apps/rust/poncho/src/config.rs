@@ -14,6 +14,7 @@ pub struct VllmProxyConfig {
     pub port: u16,
     pub model_name_override: String,
     pub allow_logprobs: bool,
+    pub crop_max_tokens: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
