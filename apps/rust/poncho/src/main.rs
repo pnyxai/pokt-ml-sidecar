@@ -30,6 +30,34 @@ async fn main() {
     // Start the logger
     env_logger::init();
 
+    // Print loaded configuration
+    info!("═══════════════════════════════════════════════════════════");
+    info!("📋 Configuration Loaded Successfully");
+    info!("═══════════════════════════════════════════════════════════");
+    info!("🔧 Server Configuration:");
+    info!("   Host: {}", config.server.host);
+    info!("   Port: {}", config.server.port);
+    info!("");
+    info!("🔗 VLLM Backend Configuration:");
+    info!("   Host: {}", config.vllm_backend.host);
+    info!("   Port: {}", config.vllm_backend.port);
+    info!("   Model Name Override: {}", config.vllm_backend.model_name_override);
+    info!("   Allow Logprobs: {}", config.vllm_backend.allow_logprobs);
+    info!("   Crop Max Tokens: {}", config.vllm_backend.crop_max_tokens);
+    info!("");
+    info!("⏱️  Routing Configuration:");
+    info!("   Timeout (seconds): {}", config.routing.timeout_seconds);
+    info!("   Max Payload Size (MB): {}", config.routing.max_payload_size_mb);
+    info!("");
+    info!("🤖 Model Configuration:");
+    info!("   Public Name: {}", config.model_config_data.model_public_name);
+    info!("   Max Position Embeddings: {}", config.model_config_data.max_position_embeddings);
+    info!("");
+    info!("📊 Logger Configuration:");
+    info!("   Log Level: {}", config.log_level);
+    info!("═══════════════════════════════════════════════════════════");
+    info!("");
+
     // Start the server
     run_server(
         config.server.host,

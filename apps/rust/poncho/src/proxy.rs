@@ -155,7 +155,14 @@ pub async fn proxy_handler(
     // If so, and there is some body here, modify it
     let processed_body = if should_modify && !body_bytes.is_empty() {
         debug!("🔧 Modifying request body...");
-        match modify_json_payload(body_bytes, state.vllm_overrides.clone(), target_url) {
+        match modify_json_payload(
+            body_bytes,
+            state.vllm_overrides.clone(),
+            target_url,
+            &state.client,
+        )
+        .await
+        {
             Ok(modified) => {
                 debug!("✅ Body modified successfully");
                 modified
@@ -323,10 +330,11 @@ fn should_modify_request(method: &Method, path: &str, headers: &HeaderMap) -> bo
 
 /// Modifies the json payload of a vllm request, overridingthe model name and
 /// raising an error if logprobs are requested but not allowed
-fn modify_json_payload(
+async fn modify_json_payload(
     body: Bytes,
     vllm_overrides: VllmOverrides,
     target_url: String,
+    client: &Client,
 ) -> Result<Bytes, ProxyError> {
     // just in case empty body check
     if body.is_empty() {
@@ -379,40 +387,38 @@ fn modify_json_payload(
             // No field requesting generation limit, so, we need to limit this
             no_limit = true;
         }
+        if tokens_req > 0 {
+            debug!(
+                "🔍 Found requested {} tokens of a max of {}. Is exceding limit? : {}",
+                tokens_req, vllm_overrides.max_tokens, limit_exceed
+            );
+        }
 
         if (vllm_overrides.crop_max_tokens && limit_exceed) || no_limit {
             // Get input tokens
             debug!("🔍 Requesting input tokens count.");
             let mut input_tokens: u64 = 0;
             if let Some(in_message) = obj.get("messages") {
-                debug!("🔍 {}", in_message.to_string());
-
+                // Create a new call, requesting one token, using the incomming request message
                 let body = serde_json::json!({
                     "messages": in_message.clone(),  // Clone the array directly
                     "model": Value::String(vllm_overrides.model_name.clone()),
                     "max_tokens": 1
                 });
-
                 // Call the model to get input tokens
-                let client = reqwest::blocking::Client::new();
-                let response = client.post(target_url).json(&body).send()?;
-
+                let response = client.post(&target_url).json(&body).send().await?;
                 // Read
-                let data: Response = response.json()?;
+                let data: Response = response.json().await?;
+                // Get input tokens
                 input_tokens = data.usage.prompt_tokens;
 
                 debug!("  Counted {} input tokens", input_tokens)
-            } else if limit_exceed && !vllm_overrides.crop_max_tokens {
-                return Err(ProxyError::Validation(
-                    format!("This model's maximum context length is {} tokens. However, you requested {} tokens (plus input tokens).", vllm_overrides.max_tokens, tokens_req)
-                ));
             }
             if input_tokens == 0 {
                 return Err(ProxyError::Validation(format!(
                     "Unable to get total input tokens."
                 )));
             }
-
             // Add a max completitions field to respect the max tokens override we set
             if (vllm_overrides.max_tokens - input_tokens) > 0 {
                 obj.insert(
@@ -424,6 +430,10 @@ fn modify_json_payload(
                     "Number of input tokens exceed the model's maximum allowed tokens.".to_string(),
                 ));
             }
+        } else if limit_exceed {
+            return Err(ProxyError::Validation(
+                    format!("This model's maximum context length is {} tokens. However, you requested {} tokens (plus input tokens).", vllm_overrides.max_tokens, tokens_req)
+                ));
         }
 
         debug!("🔧 Modified JSON payload");
