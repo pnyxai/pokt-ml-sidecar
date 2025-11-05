@@ -4,6 +4,21 @@
 
 The poncho is a performant Rust app that is designed to cover your vLLM endpoint and keep it warm and cozy doing its stuff while it connects to the Pocket Network.
 
+
+### Configuration
+
+You will only need a config file, please refer to the [example file](./apps/rust/poncho/config/config.sample.yaml).
+
+### Deployment
+
+Just create the `config.yaml` file next to the [example file](./apps/rust/poncho/config/config.sample.yaml) (with the correct data for you) and deploy with:
+
+```sh
+docker compose up
+```
+
+### Features
+
 The main features of this app are:
 - **Model name overriding on requests**: The Pocket Network will send requests for the model `pocket_network` (hopefully, if not random stuff), we take care of overriding this to match the actual backend model name.
 - **Model name overriding on responses**: The model name shown in the response will match the one advertised to Pocket Network (`pocket_network`, or whatever you set). No model name leakage.
@@ -15,3 +30,5 @@ It also supports some pocket-specific endpoints (`/pokt/*`) to provide extra (op
 - `/pokt/config-hash` : Returns the config hash (TODO).
 - `/pokt/tokenizer` : Provides the model tokenizer (TODO)
 - `/pokt/tokenizer-hash` : Returns the tokenizer hash (TODO).
+
+

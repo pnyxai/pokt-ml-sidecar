@@ -1,16 +1,42 @@
+# Set the loglevel (debug/info/error)
 log_level: "debug"
+
+# Configuration of the poncho server
 server:
-  host: "0.0.0.0"
+  # Use 0.0.0.0 to expose the poncho app
+  host: "0.0.0.0" 
+  # Port to use for poncho
   port: 8080
+
+# The configuration of you vLLM backend to cover
 vllm_backend:
+  # Where the vLLM is deployed
   host: "http://127.0.0.1"
   port: 8000
+  # The name of the model that is being served in vLLM
   model_name_override: "meta-llama/Llama-3.1-8B-Instruct"
+  # Wheter to allow the users requesting through poncho to get logprobs
   allow_logprobs: false
+  # If `true` the poncho will edit the `max_tokens` or `max_completion_tokens` 
+  # field of the incoming request to limit the amount requested and allow the 
+  # request to proceed to the vLLM backend. 
+  # So, if the `model_config_data.max_position_embeddings` is set to 4096 and
+  # a request comes with a field `max_tokens : 16000`, the poncho will edit this
+  # field and allow the request to pass with:
+  # `max_completion_tokens : model_config_data.max_position_embeddings - inputTokens`
+  # (if set to false it will simply reject any request with more than `max_position_embeddings` tokens requested)
   crop_max_tokens: true
+
+# This configures the request routing
 routing:
+  # Timeout for the backend
   timeout_seconds: 600
+  # Max payload to accept/transmit
   max_payload_size_mb: 10
+
+# This configures how the model will be publicized by the Poncho
 model_config_data:
-    model_public_name : "pocket_network"
-    max_position_embeddings : 4096
+  # Name to show to the public (and used to override model name in responses)
+  model_public_name : "pocket_network"
+  # Maximum number of tokens for requests coming though Poncho
+  max_position_embeddings : 4096
