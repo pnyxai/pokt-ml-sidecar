@@ -41,6 +41,7 @@ async fn main() {
         VllmOverrides {
             model_name: config.vllm_backend.model_name_override,
             allow_logprobs: config.vllm_backend.allow_logprobs,
+            crop_max_tokens: config.vllm_backend.crop_max_tokens,
             max_tokens: config.model_config_data.max_position_embeddings,
             overriden_name: config.model_config_data.model_public_name.clone(),
         },

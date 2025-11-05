@@ -2,10 +2,11 @@ use axum::{
     body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response as AxumResponse},
 };
 use log::{debug, error, warn};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use tokio_stream::StreamExt;
@@ -14,8 +15,19 @@ use tokio_stream::StreamExt;
 pub struct VllmOverrides {
     pub model_name: String,
     pub allow_logprobs: bool,
+    pub crop_max_tokens: bool,
     pub max_tokens: u64,
     pub overriden_name: String,
+}
+
+// These are to be used to request input token counts
+#[derive(Deserialize)]
+struct Usage {
+    prompt_tokens: u64,
+}
+#[derive(Deserialize)]
+struct Response {
+    usage: Usage,
 }
 
 // In web servers, each incoming request is handled by a separate async task.
@@ -39,28 +51,51 @@ pub enum ProxyError {
     Validation(String),
 }
 
+#[derive(Serialize)]
+struct ErrorResponse {
+    code: u32,
+    message: String,
+}
+
 impl IntoResponse for ProxyError {
-    fn into_response(self) -> Response {
-        let (status, message) = match self {
+    fn into_response(self) -> AxumResponse {
+        let (status, _code, message) = match self {
             ProxyError::Internal(msg) => {
                 error!("❌ Internal error: {}", msg);
-                (StatusCode::INTERNAL_SERVER_ERROR, msg)
+                (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg)
             }
             ProxyError::Upstream(msg) => {
                 error!("❌ Upstream error: {}", msg);
-                (StatusCode::BAD_GATEWAY, msg)
+                (StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", msg)
             }
             ProxyError::Json(msg) => {
                 error!("❌ JSON error: {}", msg);
-                (StatusCode::BAD_REQUEST, msg)
+                (StatusCode::BAD_REQUEST, "JSON_ERROR", msg)
             }
             ProxyError::Validation(msg) => {
                 error!("❌ Validation error: {}", msg);
-                (StatusCode::BAD_REQUEST, msg)
+                (StatusCode::BAD_REQUEST, "VALIDATION_ERROR", msg)
             }
         };
 
-        (status, message).into_response()
+        let error_response = ErrorResponse {
+            code: status.as_u16() as u32,
+            message,
+        };
+
+        (status, axum::Json(error_response)).into_response()
+    }
+}
+
+impl From<reqwest::Error> for ProxyError {
+    fn from(err: reqwest::Error) -> Self {
+        ProxyError::Upstream(format!("Request error: {}", err))
+    }
+}
+
+impl From<serde_json::Error> for ProxyError {
+    fn from(err: serde_json::Error) -> Self {
+        ProxyError::Json(format!("JSON error: {}", err))
     }
 }
 
@@ -71,11 +106,11 @@ pub async fn proxy_handler(
     method: Method,
     headers: HeaderMap,
     body: Body,
-) -> Result<Response, ProxyError> {
+) -> Result<AxumResponse, ProxyError> {
     // Set the backend target endpoint
-    let target_base = format!("{}:{}", state.backend_url, state.backend_port);
+    let target_base: String = format!("{}:{}", state.backend_url, state.backend_port);
     // Append the target path
-    let target_url = format!("{}/{}", target_base, path);
+    let target_url: String = format!("{}/{}", target_base, path);
 
     debug!("🎯 Proxying {} {} -> {}", method, path, target_url);
 
@@ -120,7 +155,7 @@ pub async fn proxy_handler(
     // If so, and there is some body here, modify it
     let processed_body = if should_modify && !body_bytes.is_empty() {
         debug!("🔧 Modifying request body...");
-        match modify_json_payload(body_bytes, state.vllm_overrides.clone()) {
+        match modify_json_payload(body_bytes, state.vllm_overrides.clone(), target_url) {
             Ok(modified) => {
                 debug!("✅ Body modified successfully");
                 modified
@@ -288,7 +323,11 @@ fn should_modify_request(method: &Method, path: &str, headers: &HeaderMap) -> bo
 
 /// Modifies the json payload of a vllm request, overridingthe model name and
 /// raising an error if logprobs are requested but not allowed
-fn modify_json_payload(body: Bytes, vllm_overrides: VllmOverrides) -> Result<Bytes, ProxyError> {
+fn modify_json_payload(
+    body: Bytes,
+    vllm_overrides: VllmOverrides,
+    target_url: String,
+) -> Result<Bytes, ProxyError> {
     // just in case empty body check
     if body.is_empty() {
         return Ok(body);
@@ -304,7 +343,7 @@ fn modify_json_payload(body: Bytes, vllm_overrides: VllmOverrides) -> Result<Byt
         if obj.contains_key("model") {
             obj.insert(
                 "model".to_string(),
-                Value::String(vllm_overrides.model_name),
+                Value::String(vllm_overrides.model_name.clone()),
             );
         }
 
@@ -317,16 +356,73 @@ fn modify_json_payload(body: Bytes, vllm_overrides: VllmOverrides) -> Result<Byt
             ));
         }
 
+        let mut limit_exceed: bool = false;
+        let mut no_limit: bool = false;
+        let mut tokens_req: u64 = 0;
         // Check for max_tokens
         if let Some(max_tokens) = obj.get("max_tokens") {
             if let Some(max_tokens_val) = max_tokens.as_u64() {
                 if max_tokens_val > vllm_overrides.max_tokens {
-                    // TODO : Account for context
-                    obj.insert(
-                        "max_tokens".to_string(),
-                        Value::from(vllm_overrides.max_tokens),
-                    );
+                    limit_exceed = true;
                 }
+                tokens_req = max_tokens_val;
+            }
+        // Check for max_completion_tokens
+        } else if let Some(max_tokens) = obj.get("max_completion_tokens") {
+            if let Some(max_tokens_val) = max_tokens.as_u64() {
+                if max_tokens_val > vllm_overrides.max_tokens {
+                    limit_exceed = true;
+                }
+                tokens_req = max_tokens_val;
+            }
+        } else {
+            // No field requesting generation limit, so, we need to limit this
+            no_limit = true;
+        }
+
+        if (vllm_overrides.crop_max_tokens && limit_exceed) || no_limit {
+            // Get input tokens
+            debug!("🔍 Requesting input tokens count.");
+            let mut input_tokens: u64 = 0;
+            if let Some(in_message) = obj.get("messages") {
+                debug!("🔍 {}", in_message.to_string());
+
+                let body = serde_json::json!({
+                    "messages": in_message.clone(),  // Clone the array directly
+                    "model": Value::String(vllm_overrides.model_name.clone()),
+                    "max_tokens": 1
+                });
+
+                // Call the model to get input tokens
+                let client = reqwest::blocking::Client::new();
+                let response = client.post(target_url).json(&body).send()?;
+
+                // Read
+                let data: Response = response.json()?;
+                input_tokens = data.usage.prompt_tokens;
+
+                debug!("  Counted {} input tokens", input_tokens)
+            } else if limit_exceed && !vllm_overrides.crop_max_tokens {
+                return Err(ProxyError::Validation(
+                    format!("This model's maximum context length is {} tokens. However, you requested {} tokens (plus input tokens).", vllm_overrides.max_tokens, tokens_req)
+                ));
+            }
+            if input_tokens == 0 {
+                return Err(ProxyError::Validation(format!(
+                    "Unable to get total input tokens."
+                )));
+            }
+
+            // Add a max completitions field to respect the max tokens override we set
+            if (vllm_overrides.max_tokens - input_tokens) > 0 {
+                obj.insert(
+                    "max_completion_tokens".to_string(),
+                    Value::from(vllm_overrides.max_tokens - input_tokens),
+                );
+            } else {
+                return Err(ProxyError::Validation(
+                    "Number of input tokens exceed the model's maximum allowed tokens.".to_string(),
+                ));
             }
         }
 
@@ -343,7 +439,7 @@ fn modify_json_payload(body: Bytes, vllm_overrides: VllmOverrides) -> Result<Byt
 async fn handle_streaming_response(
     upstream_response: reqwest::Response,
     new_model_name: String,
-) -> Result<Response, ProxyError> {
+) -> Result<AxumResponse, ProxyError> {
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
 
@@ -390,7 +486,7 @@ async fn handle_streaming_response(
 
     let body = Body::from_stream(body_stream);
 
-    let mut response = Response::builder().status(status.as_u16());
+    let mut response = AxumResponse::builder().status(status.as_u16());
 
     for (name, value) in response_headers.iter() {
         response = response.header(name, value);
@@ -448,7 +544,7 @@ fn modify_json_chunk(
 async fn handle_regular_response(
     upstream_response: reqwest::Response,
     new_model_name: String,
-) -> Result<Response, ProxyError> {
+) -> Result<AxumResponse, ProxyError> {
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
 
@@ -499,7 +595,7 @@ async fn handle_regular_response(
         }
     }
 
-    let mut response = Response::builder().status(status.as_u16());
+    let mut response = AxumResponse::builder().status(status.as_u16());
 
     for (name, value) in response_headers.iter() {
         response = response.header(name, value);

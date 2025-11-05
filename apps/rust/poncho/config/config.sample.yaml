@@ -7,6 +7,7 @@ vllm_backend:
   port: 8000
   model_name_override: "meta-llama/Llama-3.1-8B-Instruct"
   allow_logprobs: false
+  crop_max_tokens: true
 routing:
   timeout_seconds: 600
   max_payload_size_mb: 10
