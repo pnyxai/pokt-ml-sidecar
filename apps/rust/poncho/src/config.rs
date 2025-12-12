@@ -27,6 +27,7 @@ pub struct RoutingConfig {
 pub struct ModelConfig {
     pub model_public_name: String,
     pub max_position_embeddings: u64,
+    pub max_tokens: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

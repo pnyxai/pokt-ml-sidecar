@@ -40,3 +40,5 @@ model_config_data:
   model_public_name : "pocket_network"
   # Maximum number of tokens for requests coming though Poncho
   max_position_embeddings : 4096
+  # Maximum number of tokens to generate (should be lower than max_position_embeddings)
+  max_tokens: 4095

@@ -26,7 +26,9 @@ async fn main() {
     };
 
     // Set log level from config
-    std::env::set_var("RUST_LOG", &config.log_level);
+    unsafe {
+        std::env::set_var("RUST_LOG", &config.log_level);
+    }
     // Start the logger
     env_logger::init();
 
@@ -41,17 +43,36 @@ async fn main() {
     info!("🔗 VLLM Backend Configuration:");
     info!("   Host: {}", config.vllm_backend.host);
     info!("   Port: {}", config.vllm_backend.port);
-    info!("   Model Name Override: {}", config.vllm_backend.model_name_override);
+    info!(
+        "   Model Name Override: {}",
+        config.vllm_backend.model_name_override
+    );
     info!("   Allow Logprobs: {}", config.vllm_backend.allow_logprobs);
-    info!("   Crop Max Tokens: {}", config.vllm_backend.crop_max_tokens);
+    info!(
+        "   Crop Max Tokens: {}",
+        config.vllm_backend.crop_max_tokens
+    );
     info!("");
     info!("⏱️  Routing Configuration:");
     info!("   Timeout (seconds): {}", config.routing.timeout_seconds);
-    info!("   Max Payload Size (MB): {}", config.routing.max_payload_size_mb);
+    info!(
+        "   Max Payload Size (MB): {}",
+        config.routing.max_payload_size_mb
+    );
     info!("");
     info!("🤖 Model Configuration:");
-    info!("   Public Name: {}", config.model_config_data.model_public_name);
-    info!("   Max Position Embeddings: {}", config.model_config_data.max_position_embeddings);
+    info!(
+        "   Public Name: {}",
+        config.model_config_data.model_public_name
+    );
+    info!(
+        "   Max Position Embeddings: {}",
+        config.model_config_data.max_position_embeddings
+    );
+    info!(
+        "   Max Tokens to Generate: {}",
+        config.model_config_data.max_tokens
+    );
     info!("");
     info!("📊 Logger Configuration:");
     info!("   Log Level: {}", config.log_level);
@@ -70,11 +91,13 @@ async fn main() {
             model_name: config.vllm_backend.model_name_override,
             allow_logprobs: config.vllm_backend.allow_logprobs,
             crop_max_tokens: config.vllm_backend.crop_max_tokens,
-            max_tokens: config.model_config_data.max_position_embeddings,
+            max_tokens: config.model_config_data.max_tokens,
+            max_position_embeddings: config.model_config_data.max_position_embeddings,
             overriden_name: config.model_config_data.model_public_name.clone(),
         },
         PoktModelData {
             max_position_embeddings: config.model_config_data.max_position_embeddings.to_string(),
+            max_tokens: config.model_config_data.max_tokens.to_string(),
             model_public_name: config.model_config_data.model_public_name,
         },
     )
