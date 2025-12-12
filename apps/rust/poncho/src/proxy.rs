@@ -17,6 +17,7 @@ pub struct VllmOverrides {
     pub allow_logprobs: bool,
     pub crop_max_tokens: bool,
     pub max_tokens: u64,
+    pub max_position_embeddings: u64,
     pub overriden_name: String,
 }
 
@@ -420,10 +421,18 @@ async fn modify_json_payload(
                 )));
             }
             // Add a max completitions field to respect the max tokens override we set
-            if (vllm_overrides.max_tokens - input_tokens) > 0 {
+            if (vllm_overrides.max_position_embeddings - input_tokens) > 0 {
+                // Get available tokens from model length
+                let available_tokens = vllm_overrides.max_position_embeddings - input_tokens;
+                // Check if the context length is limmiting the generation
+                let max_completion = if available_tokens < vllm_overrides.max_tokens {
+                    available_tokens
+                } else {
+                    vllm_overrides.max_tokens
+                };
                 obj.insert(
                     "max_completion_tokens".to_string(),
-                    Value::from(vllm_overrides.max_tokens - input_tokens),
+                    Value::from(max_completion),
                 );
             } else {
                 return Err(ProxyError::Validation(

@@ -18,6 +18,7 @@ pub struct PoktState {
 pub struct PoktModelData {
     pub model_public_name: String,
     pub max_position_embeddings: String,
+    pub max_tokens: String,
 }
 
 pub enum PoktError {
