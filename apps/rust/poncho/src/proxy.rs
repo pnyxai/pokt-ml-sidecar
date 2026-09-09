@@ -53,7 +53,7 @@ pub enum ProxyError {
 }
 
 #[derive(Serialize)]
-struct ErrorResponse {
+pub struct ErrorResponse {
     code: u32,
     message: String,
 }
@@ -110,8 +110,8 @@ pub async fn proxy_handler(
 ) -> Result<AxumResponse, ProxyError> {
     // Set the backend target endpoint
     let target_base: String = format!("{}:{}", state.backend_url, state.backend_port);
-    // Append the target path
-    let target_url: String = format!("{}/{}", target_base, path);
+    // Prepend v1/ because this handler is only mounted under /v1/*path
+    let target_url: String = format!("{}/v1/{}", target_base, path);
 
     debug!("🎯 Proxying {} {} -> {}", method, path, target_url);
 
@@ -404,6 +404,7 @@ async fn modify_json_payload(
                 let body = serde_json::json!({
                     "messages": in_message.clone(),  // Clone the array directly
                     "model": Value::String(vllm_overrides.model_name.clone()),
+                    // TODO: Add tools field
                     "max_tokens": 1
                 });
                 // Call the model to get input tokens
@@ -625,4 +626,32 @@ async fn handle_regular_response(
     response
         .body(Body::from(modified_body_bytes))
         .map_err(|e| ProxyError::Internal(format!("Failed to build regular response: {}", e)))
+}
+
+/// Returns an OpenAI-compatible /v1/models response with the configured model name
+pub async fn models_handler(State(state): State<Arc<ProxyState>>) -> impl IntoResponse {
+    let model_name = state.vllm_overrides.overriden_name.clone();
+
+    let response = serde_json::json!({
+        "object": "list",
+        "data": [
+            {
+                "id": model_name,
+                "object": "model",
+                "created": 1677610602,
+                "owned_by": "pocket-network-sidecar"
+            }
+        ]
+    });
+
+    (StatusCode::OK, axum::Json(response))
+}
+
+/// Fallback handler for unmatched routes, returns a JSON 404 error
+pub async fn not_found_handler() -> impl IntoResponse {
+    let error_response = ErrorResponse {
+        code: 404,
+        message: "Not found / Unavailable in sidecar".to_string(),
+    };
+    (StatusCode::NOT_FOUND, axum::Json(error_response))
 }

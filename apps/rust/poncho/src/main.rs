@@ -155,8 +155,12 @@ async fn run_server(
     // Sets up the web application routing:
     let app = Router::new()
         .nest("/pokt", pokt_router)
-        // Catches all paths and HTTP methods, routing them to proxy_handler
-        .route("/*path", any(proxy::proxy_handler))
+        // OpenAI-compatible models endpoint (static response)
+        .route("/v1/models", any(proxy::models_handler))
+        // Proxy all other v1/ paths to the backend
+        .route("/v1/*path", any(proxy::proxy_handler))
+        // Reject everything else with a JSON 404
+        .fallback(proxy::not_found_handler)
         // Allows cross-origin requests from any domain
         .layer(CorsLayer::permissive())
         // Limits request body size to 10 megabytes
