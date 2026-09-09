@@ -54,8 +54,8 @@ pub enum ProxyError {
 
 #[derive(Serialize)]
 pub struct ErrorResponse {
-    code: u32,
-    message: String,
+    pub code: u32,
+    pub message: String,
 }
 
 impl IntoResponse for ProxyError {
@@ -647,11 +647,50 @@ pub async fn models_handler(State(state): State<Arc<ProxyState>>) -> impl IntoRe
     (StatusCode::OK, axum::Json(response))
 }
 
+/// Health check handler: pings the backend /health endpoint.
+/// Returns 200 with {"status": "healthy"} if the backend responds with 200.
+/// Returns a JSON ProxyError otherwise.
+pub async fn health_handler(State(state): State<Arc<ProxyState>>) -> Result<impl IntoResponse, ProxyError> {
+    let target_url = format!("{}:{}/health", state.backend_url, state.backend_port);
+
+    let health_timeout = Duration::from_secs(3);
+
+    let request_future = state.client.get(&target_url).send();
+
+    match tokio::time::timeout(health_timeout, request_future).await {
+        Ok(Ok(response)) => {
+            if response.status().is_success() {
+                Ok((StatusCode::OK, axum::Json(serde_json::json!({"status": "healthy"}))))
+            } else {
+                error!("❌ Backend health check returned non-2xx status: {}", response.status());
+                Err(ProxyError::Upstream(format!(
+                    "Backend health check returned {}",
+                    response.status()
+                )))
+            }
+        }
+        Ok(Err(e)) => {
+            error!("❌ Backend health check request failed: {}", e);
+            Err(ProxyError::Upstream(format!(
+                "Backend health check failed: {}",
+                e
+            )))
+        }
+        Err(_) => {
+            error!("❌ Backend health check timed out after {} seconds", health_timeout.as_secs());
+            Err(ProxyError::Upstream(format!(
+                "Backend health check timed out after {} seconds",
+                health_timeout.as_secs()
+            )))
+        }
+    }
+}
+
 /// Fallback handler for unmatched routes, returns a JSON 404 error
 pub async fn not_found_handler() -> impl IntoResponse {
     let error_response = ErrorResponse {
         code: 404,
-        message: "Not found / Unavailable in sidecar".to_string(),
+        message: "Not found".to_string(),
     };
     (StatusCode::NOT_FOUND, axum::Json(error_response))
 }

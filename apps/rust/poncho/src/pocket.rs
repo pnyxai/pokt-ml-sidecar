@@ -9,6 +9,8 @@ use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
+use crate::proxy::ErrorResponse;
+
 #[derive(Clone)]
 pub struct PoktState {
     pub model_data: PoktModelData,
@@ -34,7 +36,12 @@ impl IntoResponse for PoktError {
             }
         };
 
-        (status, message).into_response()
+        let error_response = ErrorResponse {
+            code: status.as_u16() as u32,
+            message,
+        };
+
+        (status, Json(error_response)).into_response()
     }
 }
 

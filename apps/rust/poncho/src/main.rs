@@ -2,7 +2,7 @@ mod config;
 mod pocket;
 mod proxy;
 
-use axum::{routing::any, Router};
+use axum::{routing::{any, get}, Router};
 use log::info;
 use reqwest::Client;
 use std::{sync::Arc, time::Duration};
@@ -155,6 +155,8 @@ async fn run_server(
     // Sets up the web application routing:
     let app = Router::new()
         .nest("/pokt", pokt_router)
+        // Health check: probes the backend /health endpoint
+        .route("/health", get(proxy::health_handler))
         // OpenAI-compatible models endpoint (static response)
         .route("/v1/models", any(proxy::models_handler))
         // Proxy all other v1/ paths to the backend
