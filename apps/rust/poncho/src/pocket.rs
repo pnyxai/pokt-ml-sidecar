@@ -31,7 +31,7 @@ impl IntoResponse for PoktError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             PoktError::Validation(msg) => {
-                error!("❌ Validation error: {}", msg);
+                error!("[POKT] ❌ Validation error: {}", msg);
                 (StatusCode::BAD_REQUEST, msg)
             }
         };
@@ -53,7 +53,7 @@ pub async fn pokt_handler(
     _headers: HeaderMap,
     _body: Body,
 ) -> Result<Response, PoktError> {
-    debug!("🎯 POKT");
+    debug!("[POKT] 🎯 Data Request");
 
     if method == Method::GET {
         if path == "config" {

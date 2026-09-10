@@ -33,59 +33,59 @@ async fn main() {
     env_logger::init();
 
     // Print loaded configuration
-    info!("═══════════════════════════════════════════════════════════");
-    info!("📋 Configuration Loaded Successfully");
-    info!("═══════════════════════════════════════════════════════════");
-    info!("🔧 Server Configuration:");
-    info!("   Host: {}", config.server.host);
-    info!("   Port: {}", config.server.port);
-    info!("");
-    info!("🔗 VLLM Backend Configuration:");
-    info!("   Host: {}", config.vllm_backend.host);
-    info!("   Port: {}", config.vllm_backend.port);
+    info!("[STARTUP] ═══════════════════════════════════════════════════════════");
+    info!("[STARTUP] 📋 Configuration Loaded Successfully");
+    info!("[STARTUP] ═══════════════════════════════════════════════════════════");
+    info!("[STARTUP] 🔧 Server Configuration:");
+    info!("[STARTUP]    Host: {}", config.server.host);
+    info!("[STARTUP]    Port: {}", config.server.port);
+    info!("[STARTUP] ");
+    info!("[STARTUP] 🔗 VLLM Backend Configuration:");
+    info!("[STARTUP]    Host: {}", config.vllm_backend.host);
+    info!("[STARTUP]    Port: {}", config.vllm_backend.port);
     info!(
-        "   Model Name Override: {}",
+        "[STARTUP]    Model Name Override: {}",
         config.vllm_backend.model_name_override
     );
-    info!("   Allow Logprobs: {}", config.vllm_backend.allow_logprobs);
+    info!("[STARTUP]    Allow Logprobs: {}", config.vllm_backend.allow_logprobs);
     info!(
-        "   Crop Max Tokens: {}",
+        "[STARTUP]    Crop Max Tokens: {}",
         config.vllm_backend.crop_max_tokens
     );
     info!(
-        "   Max Batched Texts (embeddings): {:?}",
+        "[STARTUP]    Max Batched Texts (embeddings): {:?}",
         config.vllm_backend.max_batched_texts_embedding
     );
     info!(
-        "   Max Rerank Documents: {:?}",
+        "[STARTUP]    Max Rerank Documents: {:?}",
         config.vllm_backend.max_rerank_documents
     );
-    info!("");
-    info!("⏱️  Routing Configuration:");
-    info!("   Timeout (seconds): {}", config.routing.timeout_seconds);
+    info!("[STARTUP] ");
+    info!("[STARTUP] ⏱️  Routing Configuration:");
+    info!("[STARTUP]    Timeout (seconds): {}", config.routing.timeout_seconds);
     info!(
-        "   Max Payload Size (MB): {}",
+        "[STARTUP]    Max Payload Size (MB): {}",
         config.routing.max_payload_size_mb
     );
-    info!("");
-    info!("🤖 Model Configuration:");
+    info!("[STARTUP] ");
+    info!("[STARTUP] 🤖 Model Configuration:");
     info!(
-        "   Public Name: {}",
+        "[STARTUP]    Public Name: {}",
         config.model_config_data.model_public_name
     );
     info!(
-        "   Max Position Embeddings: {}",
+        "[STARTUP]    Max Position Embeddings: {}",
         config.model_config_data.max_position_embeddings
     );
     info!(
-        "   Max Tokens to Generate: {}",
+        "[STARTUP]    Max Tokens to Generate: {}",
         config.model_config_data.max_tokens
     );
-    info!("");
-    info!("📊 Logger Configuration:");
-    info!("   Log Level: {}", config.log_level);
-    info!("═══════════════════════════════════════════════════════════");
-    info!("");
+    info!("[STARTUP] ");
+    info!("[STARTUP] 📊 Logger Configuration:");
+    info!("[STARTUP]    Log Level: {}", config.log_level);
+    info!("[STARTUP] ═══════════════════════════════════════════════════════════");
+    info!("[STARTUP] ");
 
     // Start the server
     run_server(
@@ -195,9 +195,9 @@ async fn run_server(
 
     // Log if success
     if let Ok(socket) = listener.local_addr() {
-        info!("High-performance proxy server running on {}", socket);
-        info!("Worker threads: 8 (configured)");
-        info!("Ready to handle high traffic loads...");
+        info!("[STARTUP] High-performance proxy server running on {}", socket);
+        info!("[STARTUP] Worker threads: 8 (configured)");
+        info!("[STARTUP] Ready to handle high traffic loads...");
     }
 
     // Start the server
@@ -239,5 +239,5 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 
-    info!("Gracefully shutting down proxy server...");
+    info!("[SHUTDOWN] Gracefully shutting down proxy server...");
 }
