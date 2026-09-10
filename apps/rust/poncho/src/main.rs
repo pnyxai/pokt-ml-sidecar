@@ -2,7 +2,7 @@ mod config;
 mod pocket;
 mod proxy;
 
-use axum::{routing::{any, get}, Router};
+use axum::{routing::{any, get, post}, Router};
 use log::info;
 use reqwest::Client;
 use std::{sync::Arc, time::Duration};
@@ -52,6 +52,14 @@ async fn main() {
         "   Crop Max Tokens: {}",
         config.vllm_backend.crop_max_tokens
     );
+    info!(
+        "   Max Batched Texts (embeddings): {:?}",
+        config.vllm_backend.max_batched_texts_embedding
+    );
+    info!(
+        "   Max Rerank Documents: {:?}",
+        config.vllm_backend.max_rerank_documents
+    );
     info!("");
     info!("⏱️  Routing Configuration:");
     info!("   Timeout (seconds): {}", config.routing.timeout_seconds);
@@ -94,6 +102,8 @@ async fn main() {
             max_tokens: config.model_config_data.max_tokens,
             max_position_embeddings: config.model_config_data.max_position_embeddings,
             overriden_name: config.model_config_data.model_public_name.clone(),
+            max_batched_texts_embedding: config.vllm_backend.max_batched_texts_embedding,
+            max_rerank_documents: config.vllm_backend.max_rerank_documents,
         },
         PoktModelData {
             max_position_embeddings: config.model_config_data.max_position_embeddings.to_string(),
@@ -159,6 +169,10 @@ async fn run_server(
         .route("/health", get(proxy::health_handler))
         // OpenAI-compatible models endpoint (static response)
         .route("/v1/models", any(proxy::models_handler))
+        // Embeddings endpoint with batch size validation
+        .route("/v1/embeddings", post(proxy::embeddings_handler))
+        // Rerank endpoint with document count validation
+        .route("/v1/rerank", post(proxy::rerank_handler))
         // Proxy all other v1/ paths to the backend
         .route("/v1/*path", any(proxy::proxy_handler))
         // Reject everything else with a JSON 404

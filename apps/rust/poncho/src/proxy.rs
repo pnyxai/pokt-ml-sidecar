@@ -19,6 +19,8 @@ pub struct VllmOverrides {
     pub max_tokens: u64,
     pub max_position_embeddings: u64,
     pub overriden_name: String,
+    pub max_batched_texts_embedding: Option<usize>,
+    pub max_rerank_documents: Option<usize>,
 }
 
 // These are to be used to request input token counts
@@ -329,7 +331,7 @@ fn should_modify_request(method: &Method, path: &str, headers: &HeaderMap) -> bo
             .unwrap_or(false)
 }
 
-/// Modifies the json payload of a vllm request, overridingthe model name and
+/// Modifies the json payload of a vllm request, overriding the model name and
 /// raising an error if logprobs are requested but not allowed
 async fn modify_json_payload(
     body: Bytes,
@@ -684,6 +686,172 @@ pub async fn health_handler(State(state): State<Arc<ProxyState>>) -> Result<impl
             )))
         }
     }
+}
+
+/// Forwards a JSON request to the backend and returns the response body.
+/// Used by embeddings and rerank handlers (no streaming).
+async fn forward_json_request(
+    state: &ProxyState,
+    path: &str,
+    headers: HeaderMap,
+    body_bytes: Bytes,
+) -> Result<AxumResponse, ProxyError> {
+    let target_url = format!("{}:{}/{}", state.backend_url, state.backend_port, path);
+
+    let mut upstream_headers = reqwest::header::HeaderMap::new();
+    upstream_headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    if let Some(auth) = headers.get("authorization") {
+        if let Ok(auth_value) = reqwest::header::HeaderValue::from_bytes(auth.as_bytes()) {
+            upstream_headers.insert(reqwest::header::AUTHORIZATION, auth_value);
+        }
+    }
+
+    debug!("📤 Forwarding JSON to {}", target_url);
+
+    let response = state
+        .client
+        .post(&target_url)
+        .headers(upstream_headers)
+        .body(body_bytes)
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("Backend request failed: {}", e)))?;
+
+    let status = response.status();
+    let resp_headers = response.headers().clone();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("Failed to read backend response: {}", e)))?;
+
+    let mut response_headers = HeaderMap::with_capacity(resp_headers.len());
+    for (name, value) in resp_headers.iter() {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_str(name.as_str()),
+            HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            if name.as_str() == "content-length" {
+                if let Ok(value) = HeaderValue::from_str(format!("{}", body.len()).as_str()) {
+                    response_headers.insert(name, value);
+                }
+            } else {
+                response_headers.insert(name, value);
+            }
+        }
+    }
+
+    let mut response = AxumResponse::builder().status(status.as_u16());
+    for (name, value) in response_headers.iter() {
+        response = response.header(name, value);
+    }
+
+    response
+        .body(Body::from(body))
+        .map_err(|e| ProxyError::Internal(format!("Failed to build response: {}", e)))
+}
+
+/// Embeddings handler: validates batch size and proxies to backend.
+/// Accepts both OpenAI-style `input` and vLLM-style `texts`.
+pub async fn embeddings_handler(
+    State(state): State<Arc<ProxyState>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<AxumResponse, ProxyError> {
+    debug!("📥 Reading embeddings request body...");
+    let body_bytes = match axum::body::to_bytes(body, state.max_payload_size_mb * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("❌ Failed to read embeddings body: {}", e);
+            return Err(ProxyError::Internal(format!(
+                "Failed to read request body: {}",
+                e
+            )));
+        }
+    };
+
+    let mut json: Value = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
+
+    let model_name = state.vllm_overrides.model_name.clone();
+
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model_name));
+
+        // Count texts / input
+        let count = if let Some(texts) = obj.get("texts").and_then(|v| v.as_array()) {
+            texts.len()
+        } else if let Some(input) = obj.get("input") {
+            if let Some(arr) = input.as_array() {
+                arr.len()
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+
+        if let Some(max) = state.vllm_overrides.max_batched_texts_embedding {
+            if count > max {
+                return Err(ProxyError::Validation(format!(
+                    "Too many texts for embedding: {} > maximum allowed {}",
+                    count, max
+                )));
+            }
+        }
+    }
+
+    let modified_json = serde_json::to_vec(&json)
+        .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
+
+    forward_json_request(&state, "v1/embeddings", headers, Bytes::from(modified_json)).await
+}
+
+/// Rerank handler: validates document count and proxies to backend.
+pub async fn rerank_handler(
+    State(state): State<Arc<ProxyState>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<AxumResponse, ProxyError> {
+    debug!("📥 Reading rerank request body...");
+    let body_bytes = match axum::body::to_bytes(body, state.max_payload_size_mb * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("❌ Failed to read rerank body: {}", e);
+            return Err(ProxyError::Internal(format!(
+                "Failed to read request body: {}",
+                e
+            )));
+        }
+    };
+
+    let mut json: Value = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
+
+    let model_name = state.vllm_overrides.model_name.clone();
+
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model_name));
+
+        if let Some(docs) = obj.get("documents").and_then(|v| v.as_array()) {
+            let count = docs.len();
+            if let Some(max) = state.vllm_overrides.max_rerank_documents {
+                if count > max {
+                    return Err(ProxyError::Validation(format!(
+                        "Too many documents for rerank: {} > maximum allowed {}",
+                        count, max
+                    )));
+                }
+            }
+        }
+    }
+
+    let modified_json = serde_json::to_vec(&json)
+        .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
+
+    forward_json_request(&state, "v1/rerank", headers, Bytes::from(modified_json)).await
 }
 
 /// Fallback handler for unmatched routes, returns a JSON 404 error

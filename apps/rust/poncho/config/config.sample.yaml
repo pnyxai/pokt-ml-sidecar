@@ -26,6 +26,10 @@ vllm_backend:
   # `max_completion_tokens : model_config_data.max_position_embeddings - inputTokens`
   # (if set to false it will simply reject any request with more than `max_position_embeddings` tokens requested)
   crop_max_tokens: true
+  # Optional: maximum number of texts allowed in a single /v1/embeddings request
+  # max_batched_texts_embedding: 100
+  # Optional: maximum number of documents allowed in a single /v1/rerank request
+  # max_rerank_documents: 50
 
 # This configures the request routing
 routing:
