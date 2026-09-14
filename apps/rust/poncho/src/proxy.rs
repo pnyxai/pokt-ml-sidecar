@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response as AxumResponse},
 };
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +19,8 @@ pub struct VllmOverrides {
     pub max_tokens: u64,
     pub max_position_embeddings: u64,
     pub overriden_name: String,
+    pub max_batched_texts_embedding: Option<usize>,
+    pub max_rerank_documents: Option<usize>,
 }
 
 // These are to be used to request input token counts
@@ -53,28 +55,28 @@ pub enum ProxyError {
 }
 
 #[derive(Serialize)]
-struct ErrorResponse {
-    code: u32,
-    message: String,
+pub struct ErrorResponse {
+    pub code: u32,
+    pub message: String,
 }
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> AxumResponse {
         let (status, _code, message) = match self {
             ProxyError::Internal(msg) => {
-                error!("❌ Internal error: {}", msg);
+                error!("[PROXY] ❌ Internal error: {}", msg);
                 (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg)
             }
             ProxyError::Upstream(msg) => {
-                error!("❌ Upstream error: {}", msg);
+                error!("[PROXY] ❌ Upstream error: {}", msg);
                 (StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", msg)
             }
             ProxyError::Json(msg) => {
-                error!("❌ JSON error: {}", msg);
+                error!("[PROXY] ❌ JSON error: {}", msg);
                 (StatusCode::BAD_REQUEST, "JSON_ERROR", msg)
             }
             ProxyError::Validation(msg) => {
-                error!("❌ Validation error: {}", msg);
+                error!("[PROXY] ❌ Validation error: {}", msg);
                 (StatusCode::BAD_REQUEST, "VALIDATION_ERROR", msg)
             }
         };
@@ -110,10 +112,10 @@ pub async fn proxy_handler(
 ) -> Result<AxumResponse, ProxyError> {
     // Set the backend target endpoint
     let target_base: String = format!("{}:{}", state.backend_url, state.backend_port);
-    // Append the target path
-    let target_url: String = format!("{}/{}", target_base, path);
+    // Prepend v1/ because this handler is only mounted under /v1/*path
+    let target_url: String = format!("{}/v1/{}", target_base, path);
 
-    debug!("🎯 Proxying {} {} -> {}", method, path, target_url);
+    debug!("[PROXY] 🎯 Proxying {} {} -> {}", method, path, target_url);
 
     // Build query string, if any, after the backend path (not really tested)
     let query_string = if params.is_empty() {
@@ -134,15 +136,15 @@ pub async fn proxy_handler(
     let full_url = format!("{}{}", target_url, query_string);
 
     // Read body of the request, up to the given number of MBs
-    debug!("📥 Reading request body...");
+    debug!("[PROXY] 📥 Reading request body...");
     let body_bytes = match axum::body::to_bytes(body, state.max_payload_size_mb * 1024 * 1024).await
     {
         Ok(bytes) => {
-            debug!("✅ Body read successfully: {} bytes", bytes.len());
+            debug!("[PROXY] ✅ Body read successfully: {} bytes", bytes.len());
             bytes
         }
         Err(e) => {
-            error!("❌ Failed to read body: {}", e);
+            error!("[PROXY] ❌ Failed to read body: {}", e);
             return Err(ProxyError::Internal(format!(
                 "Failed to read request body: {}",
                 e
@@ -155,7 +157,7 @@ pub async fn proxy_handler(
 
     // If so, and there is some body here, modify it
     let processed_body = if should_modify && !body_bytes.is_empty() {
-        debug!("🔧 Modifying request body...");
+        debug!("[MODIFY] 🔧 Modifying request body...");
         match modify_json_payload(
             body_bytes,
             state.vllm_overrides.clone(),
@@ -165,11 +167,11 @@ pub async fn proxy_handler(
         .await
         {
             Ok(modified) => {
-                debug!("✅ Body modified successfully");
+                debug!("[MODIFY] ✅ Body modified successfully");
                 modified
             }
             Err(e) => {
-                warn!("❌ Failed to modify body: {:?}", e);
+                warn!("[MODIFY] ❌ Failed to modify body: {:?}", e);
                 return Err(e);
             }
         }
@@ -178,7 +180,7 @@ pub async fn proxy_handler(
     };
 
     // Prepare headers
-    debug!("📋 Preparing headers...");
+    debug!("[PROXY] 📋 Preparing headers...");
     let mut upstream_headers = reqwest::header::HeaderMap::new();
 
     // Only add content-type if we have a body
@@ -197,14 +199,14 @@ pub async fn proxy_handler(
     }
 
     // Debug: Print all headers being sent
-    debug!("📋 Headers to send:");
+    debug!("[PROXY] 📋 Headers to send:");
     for (name, value) in upstream_headers.iter() {
-        debug!("   {}: {}", name, value.to_str().unwrap_or("[unprintable]"));
+        debug!("[PROXY]    {}: {}", name, value.to_str().unwrap_or("[unprintable]"));
     }
-    debug!("🚀 Making upstream request...");
-    debug!("   URL: {}", full_url);
-    debug!("   Method: {}", method);
-    debug!("   Body size: {} bytes", processed_body.len());
+    debug!("[PROXY] 🚀 Making upstream request...");
+    debug!("[PROXY]    URL: {}", full_url);
+    debug!("[PROXY]    Method: {}", method);
+    debug!("[PROXY]    Body size: {} bytes", processed_body.len());
 
     // Build request
     let request_builder = state
@@ -217,15 +219,15 @@ pub async fn proxy_handler(
         // add body
         .body(processed_body);
 
-    debug!("⏳ Sending request to backend...");
-    debug!("🔍 About to call request_builder.send()...");
+    debug!("[PROXY] ⏳ Sending request to backend...");
+    debug!("[PROXY] 🔍 About to call request_builder.send()...");
 
     // Add a timeout wrapper to catch hanging requests
     let request_future = request_builder.send();
     let timeout_duration = Duration::from_secs(state.timeout);
 
     debug!(
-        "⏰ Starting request with {} second timeout...",
+        "[PROXY] ⏰ Starting request with {} second timeout...",
         timeout_duration.as_secs()
     );
 
@@ -233,18 +235,21 @@ pub async fn proxy_handler(
     let upstream_response = match tokio::time::timeout(timeout_duration, request_future).await {
         Ok(Ok(response)) => {
             debug!(
-                "✅ Got response from backend: {} - Headers: {:?}",
+                "[PROXY] ✅ Got response from backend: {} - Headers: {:?}",
                 response.status(),
                 response.headers()
             );
             response
         }
         Ok(Err(e)) => {
-            error!("❌ Request failed after send(): {:?}", e);
-            error!("❌ Is timeout: {}", e.is_timeout());
-            error!("❌ Is connect: {}", e.is_connect());
-            error!("❌ Is request: {}", e.is_request());
-            error!("❌ Is decode: {}", e.is_decode());
+            error!(
+                "[PROXY] ❌ Request failed after send(): {:?}\n\
+                 [PROXY]    Is timeout: {}\n\
+                 [PROXY]    Is connect: {}\n\
+                 [PROXY]    Is request: {}\n\
+                 [PROXY]    Is decode: {}",
+                e, e.is_timeout(), e.is_connect(), e.is_request(), e.is_decode()
+            );
 
             if e.is_timeout() {
                 return Err(ProxyError::Upstream(format!(
@@ -270,7 +275,7 @@ pub async fn proxy_handler(
         }
         Err(_) => {
             error!(
-                "❌ Request timed out after {} seconds",
+                "[PROXY] ❌ Request timed out after {} seconds",
                 timeout_duration.as_secs()
             );
             return Err(ProxyError::Upstream(format!(
@@ -293,8 +298,8 @@ pub async fn proxy_handler(
         })
         .unwrap_or(false);
 
-    println!(
-        "📦 Response type: {}",
+    info!(
+        "[PROXY] 📦 Response type: {}",
         if is_streaming { "streaming" } else { "regular" }
     );
 
@@ -329,7 +334,7 @@ fn should_modify_request(method: &Method, path: &str, headers: &HeaderMap) -> bo
             .unwrap_or(false)
 }
 
-/// Modifies the json payload of a vllm request, overridingthe model name and
+/// Modifies the json payload of a vllm request, overriding the model name and
 /// raising an error if logprobs are requested but not allowed
 async fn modify_json_payload(
     body: Bytes,
@@ -390,20 +395,21 @@ async fn modify_json_payload(
         }
         if tokens_req > 0 {
             debug!(
-                "🔍 Found requested {} tokens of a max of {}. Is exceding limit? : {}",
+                "[MODIFY] 🔍 Found requested {} tokens of a max of {}. Is exceding limit? : {}",
                 tokens_req, vllm_overrides.max_tokens, limit_exceed
             );
         }
 
         if (vllm_overrides.crop_max_tokens && limit_exceed) || no_limit {
             // Get input tokens
-            debug!("🔍 Requesting input tokens count.");
+            debug!("[MODIFY] 🔍 Requesting input tokens count.");
             let mut input_tokens: u64 = 0;
             if let Some(in_message) = obj.get("messages") {
                 // Create a new call, requesting one token, using the incomming request message
                 let body = serde_json::json!({
                     "messages": in_message.clone(),  // Clone the array directly
                     "model": Value::String(vllm_overrides.model_name.clone()),
+                    // TODO: Add tools field
                     "max_tokens": 1
                 });
                 // Call the model to get input tokens
@@ -413,7 +419,7 @@ async fn modify_json_payload(
                 // Get input tokens
                 input_tokens = data.usage.prompt_tokens;
 
-                debug!("  Counted {} input tokens", input_tokens)
+                debug!("[MODIFY]  Counted {} input tokens", input_tokens)
             }
             if input_tokens == 0 {
                 return Err(ProxyError::Validation(format!(
@@ -445,7 +451,7 @@ async fn modify_json_payload(
                 ));
         }
 
-        debug!("🔧 Modified JSON payload");
+        debug!("[MODIFY] 🔧 Modified JSON payload");
     }
 
     let modified_json = serde_json::to_vec(&json)
@@ -462,7 +468,7 @@ async fn handle_streaming_response(
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
 
-    debug!("🌊 Handling streaming response with status: {}", status);
+    debug!("[STREAM] 🌊 Handling streaming response with status: {}", status);
 
     // Copy headers
     let mut response_headers = HeaderMap::with_capacity(headers.len());
@@ -480,24 +486,24 @@ async fn handle_streaming_response(
     let body_stream = stream.map(move |chunk_result| {
         match chunk_result {
             Ok(chunk) => {
-                debug!("📦 Streaming chunk: {} bytes", chunk.len());
+                debug!("[STREAM] 📦 Streaming chunk: {} bytes", chunk.len());
 
                 // Try to parse and modify the JSON chunk
                 match modify_json_chunk(&chunk, &new_model_name) {
                     Ok(modified_chunk) => {
-                        debug!("✏️ Modified JSON chunk: {} bytes", modified_chunk.len());
+                        debug!("[STREAM] ✏️ Modified JSON chunk: {} bytes", modified_chunk.len());
                         Ok(modified_chunk)
                     }
                     Err(e) => {
                         // If parsing fails, pass through original chunk
                         // This handles cases where chunk might not be complete JSON
-                        debug!("⚠️ Failed to parse chunk as JSON (passing through): {}", e);
+                        debug!("[STREAM] ⚠️ Failed to parse chunk as JSON (passing through): {}", e);
                         Ok(chunk)
                     }
                 }
             }
             Err(e) => {
-                error!("❌ Stream error: {}", e);
+                error!("[STREAM] ❌ Stream error: {}", e);
                 Err(std::io::Error::new(std::io::ErrorKind::Other, e))
             }
         }
@@ -511,7 +517,7 @@ async fn handle_streaming_response(
         response = response.header(name, value);
     }
 
-    debug!("✅ Streaming response built successfully");
+    debug!("[STREAM] ✅ Streaming response built successfully");
 
     response
         .body(body)
@@ -567,14 +573,14 @@ async fn handle_regular_response(
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
 
-    debug!("📄 Handling regular response with status: {}", status);
+    debug!("[RESPONSE] 📄 Handling regular response with status: {}", status);
 
     let body_bytes = upstream_response
         .bytes()
         .await
         .map_err(|e| ProxyError::Upstream(format!("Failed to read response body: {}", e)))?;
 
-    debug!("📥 Response body: {} bytes", body_bytes.len());
+    debug!("[RESPONSE] 📥 Response body: {} bytes", body_bytes.len());
 
     // Override model name
     // Read all the body as a json, it should be a json
@@ -590,7 +596,7 @@ async fn handle_regular_response(
         .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
     let modified_body_bytes = Bytes::from(modified_json);
     debug!(
-        "✏️ Modified JSON regular response: {} bytes",
+        "[RESPONSE] ✏️ Modified JSON regular response: {} bytes",
         modified_body_bytes.len()
     );
 
@@ -620,9 +626,242 @@ async fn handle_regular_response(
         response = response.header(name, value);
     }
 
-    debug!("✅ Regular response built successfully");
+    debug!("[RESPONSE] ✅ Regular response built successfully");
 
     response
         .body(Body::from(modified_body_bytes))
         .map_err(|e| ProxyError::Internal(format!("Failed to build regular response: {}", e)))
+}
+
+/// Returns an OpenAI-compatible /v1/models response with the configured model name
+pub async fn models_handler(State(state): State<Arc<ProxyState>>) -> impl IntoResponse {
+    let model_name = state.vllm_overrides.overriden_name.clone();
+
+    let response = serde_json::json!({
+        "object": "list",
+        "data": [
+            {
+                "id": model_name,
+                "object": "model",
+                "created": 1677610602,
+                "owned_by": "pocket-network-sidecar"
+            }
+        ]
+    });
+
+    (StatusCode::OK, axum::Json(response))
+}
+
+/// Health check handler: pings the backend /health endpoint.
+/// Returns 200 with {"status": "healthy"} if the backend responds with 200.
+/// Returns a JSON ProxyError otherwise.
+pub async fn health_handler(State(state): State<Arc<ProxyState>>) -> Result<impl IntoResponse, ProxyError> {
+    let target_url = format!("{}:{}/health", state.backend_url, state.backend_port);
+
+    let health_timeout = Duration::from_secs(3);
+
+    let request_future = state.client.get(&target_url).send();
+
+    match tokio::time::timeout(health_timeout, request_future).await {
+        Ok(Ok(response)) => {
+            if response.status().is_success() {
+                Ok((StatusCode::OK, axum::Json(serde_json::json!({"status": "healthy"}))))
+            } else {
+                error!("[HEALTH] ❌ Backend health check returned non-2xx status: {}", response.status());
+                Err(ProxyError::Upstream(format!(
+                    "Backend health check returned {}",
+                    response.status()
+                )))
+            }
+        }
+        Ok(Err(e)) => {
+            error!("[HEALTH] ❌ Backend health check request failed: {}", e);
+            Err(ProxyError::Upstream(format!(
+                "Backend health check failed: {}",
+                e
+            )))
+        }
+        Err(_) => {
+            error!("[HEALTH] ❌ Backend health check timed out after {} seconds", health_timeout.as_secs());
+            Err(ProxyError::Upstream(format!(
+                "Backend health check timed out after {} seconds",
+                health_timeout.as_secs()
+            )))
+        }
+    }
+}
+
+/// Forwards a JSON request to the backend and returns the response body.
+/// Used by embeddings and rerank handlers (no streaming).
+async fn forward_json_request(
+    state: &ProxyState,
+    path: &str,
+    headers: HeaderMap,
+    body_bytes: Bytes,
+) -> Result<AxumResponse, ProxyError> {
+    let target_url = format!("{}:{}/{}", state.backend_url, state.backend_port, path);
+
+    let mut upstream_headers = reqwest::header::HeaderMap::new();
+    upstream_headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    if let Some(auth) = headers.get("authorization") {
+        if let Ok(auth_value) = reqwest::header::HeaderValue::from_bytes(auth.as_bytes()) {
+            upstream_headers.insert(reqwest::header::AUTHORIZATION, auth_value);
+        }
+    }
+
+    debug!("[PROXY] 📤 Forwarding JSON to {}", target_url);
+
+    let response = state
+        .client
+        .post(&target_url)
+        .headers(upstream_headers)
+        .body(body_bytes)
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("Backend request failed: {}", e)))?;
+
+    let status = response.status();
+    let resp_headers = response.headers().clone();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("Failed to read backend response: {}", e)))?;
+
+    let mut response_headers = HeaderMap::with_capacity(resp_headers.len());
+    for (name, value) in resp_headers.iter() {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_str(name.as_str()),
+            HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            if name.as_str() == "content-length" {
+                if let Ok(value) = HeaderValue::from_str(format!("{}", body.len()).as_str()) {
+                    response_headers.insert(name, value);
+                }
+            } else {
+                response_headers.insert(name, value);
+            }
+        }
+    }
+
+    let mut response = AxumResponse::builder().status(status.as_u16());
+    for (name, value) in response_headers.iter() {
+        response = response.header(name, value);
+    }
+
+    response
+        .body(Body::from(body))
+        .map_err(|e| ProxyError::Internal(format!("Failed to build response: {}", e)))
+}
+
+/// Embeddings handler: validates batch size and proxies to backend.
+/// Accepts both OpenAI-style `input` and vLLM-style `texts`.
+pub async fn embeddings_handler(
+    State(state): State<Arc<ProxyState>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<AxumResponse, ProxyError> {
+    debug!("[EMBED] 📥 Reading embeddings request body...");
+    let body_bytes = match axum::body::to_bytes(body, state.max_payload_size_mb * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("[EMBED] ❌ Failed to read embeddings body: {}", e);
+            return Err(ProxyError::Internal(format!(
+                "Failed to read request body: {}",
+                e
+            )));
+        }
+    };
+
+    let mut json: Value = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
+
+    let model_name = state.vllm_overrides.model_name.clone();
+
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model_name));
+
+        // Count texts / input
+        let count = if let Some(texts) = obj.get("texts").and_then(|v| v.as_array()) {
+            texts.len()
+        } else if let Some(input) = obj.get("input") {
+            if let Some(arr) = input.as_array() {
+                arr.len()
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+
+        if let Some(max) = state.vllm_overrides.max_batched_texts_embedding {
+            if count > max {
+                return Err(ProxyError::Validation(format!(
+                    "Too many texts for embedding: {} > maximum allowed {}",
+                    count, max
+                )));
+            }
+        }
+    }
+
+    let modified_json = serde_json::to_vec(&json)
+        .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
+
+    forward_json_request(&state, "v1/embeddings", headers, Bytes::from(modified_json)).await
+}
+
+/// Rerank handler: validates document count and proxies to backend.
+pub async fn rerank_handler(
+    State(state): State<Arc<ProxyState>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<AxumResponse, ProxyError> {
+    debug!("[RERANK] 📥 Reading rerank request body...");
+    let body_bytes = match axum::body::to_bytes(body, state.max_payload_size_mb * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("[RERANK] ❌ Failed to read rerank body: {}", e);
+            return Err(ProxyError::Internal(format!(
+                "Failed to read request body: {}",
+                e
+            )));
+        }
+    };
+
+    let mut json: Value = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
+
+    let model_name = state.vllm_overrides.model_name.clone();
+
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model_name));
+
+        if let Some(docs) = obj.get("documents").and_then(|v| v.as_array()) {
+            let count = docs.len();
+            if let Some(max) = state.vllm_overrides.max_rerank_documents {
+                if count > max {
+                    return Err(ProxyError::Validation(format!(
+                        "Too many documents for rerank: {} > maximum allowed {}",
+                        count, max
+                    )));
+                }
+            }
+        }
+    }
+
+    let modified_json = serde_json::to_vec(&json)
+        .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
+
+    forward_json_request(&state, "v1/rerank", headers, Bytes::from(modified_json)).await
+}
+
+/// Fallback handler for unmatched routes, returns a JSON 404 error
+pub async fn not_found_handler() -> impl IntoResponse {
+    let error_response = ErrorResponse {
+        code: 404,
+        message: "Not found".to_string(),
+    };
+    (StatusCode::NOT_FOUND, axum::Json(error_response))
 }

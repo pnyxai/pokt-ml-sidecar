@@ -15,6 +15,8 @@ pub struct VllmProxyConfig {
     pub model_name_override: String,
     pub allow_logprobs: bool,
     pub crop_max_tokens: bool,
+    pub max_batched_texts_embedding: Option<usize>,
+    pub max_rerank_documents: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
