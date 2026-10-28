@@ -133,6 +133,25 @@ pub async fn v1_path_guard(
     next.run(request).await
 }
 
+/// Parses a request body as JSON independently of any Content-Type header.
+/// Empty or malformed bodies are rejected with a 400.
+fn parse_json_body(body: Bytes) -> Result<Value, ProxyError> {
+    if body.is_empty() {
+        return Err(ProxyError::Json(
+            "Request body must be valid JSON".to_string(),
+        ));
+    }
+
+    serde_json::from_slice(&body).map_err(|e| ProxyError::Json(format!("Invalid JSON body: {}", e)))
+}
+
+/// Serializes the parsed JSON value. Only this re-serialized form is forwarded.
+fn serialize_json_body(json: &Value) -> Result<Bytes, ProxyError> {
+    let modified_json = serde_json::to_vec(json)
+        .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
+    Ok(Bytes::from(modified_json))
+}
+
 pub async fn proxy_handler(
     State(state): State<Arc<ProxyState>>,
     Path(path): Path<String>,
@@ -183,29 +202,28 @@ pub async fn proxy_handler(
         }
     };
 
-    // Check if I should modify the resquest
-    let should_modify = should_modify_request(&method, &path, &headers);
+    // Every POST body is parsed as JSON regardless of the inbound Content-Type.
+    // Only the re-serialized value is forwarded upstream.
+    let processed_body = if method == Method::POST {
+        let mut json = parse_json_body(body_bytes)?;
 
-    // If so, and there is some body here, modify it
-    let processed_body = if should_modify && !body_bytes.is_empty() {
-        debug!("[MODIFY] 🔧 Modifying request body...");
-        match modify_json_payload(
-            body_bytes,
-            state.vllm_overrides.clone(),
-            target_url,
-            &state.client,
-        )
-        .await
-        {
-            Ok(modified) => {
-                debug!("[MODIFY] ✅ Body modified successfully");
-                modified
-            }
-            Err(e) => {
+        if should_modify_request(&method, &path) {
+            debug!("[MODIFY] 🔧 Modifying request body...");
+            if let Err(e) = modify_json_payload(
+                &mut json,
+                state.vllm_overrides.clone(),
+                target_url,
+                &state.client,
+            )
+            .await
+            {
                 warn!("[MODIFY] ❌ Failed to modify body: {:?}", e);
                 return Err(e);
             }
+            debug!("[MODIFY] ✅ Body modified successfully");
         }
+
+        serialize_json_body(&json)?
     } else {
         body_bytes
     };
@@ -214,8 +232,8 @@ pub async fn proxy_handler(
     debug!("[PROXY] 📋 Preparing headers...");
     let mut upstream_headers = reqwest::header::HeaderMap::new();
 
-    // Only add content-type if we have a body
-    if !processed_body.is_empty() {
+    // POST bodies are always forwarded as re-serialized JSON.
+    if method == Method::POST || !processed_body.is_empty() {
         upstream_headers.insert(
             reqwest::header::CONTENT_TYPE,
             reqwest::header::HeaderValue::from_static("application/json"),
@@ -360,36 +378,19 @@ pub async fn proxy_handler(
 }
 
 /// Checks whether a request body should be modified or not
-fn should_modify_request(method: &Method, path: &str, headers: &HeaderMap) -> bool {
-    // If the method is POST
-    method == Method::POST
-        // if the path is either completions or chat completions
-        && matches!(path, "chat/completions" | "completions")
-        // and if the content type is application/json
-        && headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.contains("application/json"))
-            .unwrap_or(false)
+fn should_modify_request(method: &Method, path: &str) -> bool {
+    // If the method is POST and the path is either completions or chat completions
+    method == Method::POST && matches!(path, "chat/completions" | "completions")
 }
 
 /// Modifies the json payload of a vllm request, overriding the model name and
 /// raising an error if logprobs are requested but not allowed
 async fn modify_json_payload(
-    body: Bytes,
+    json: &mut Value,
     vllm_overrides: VllmOverrides,
     target_url: String,
     client: &Client,
-) -> Result<Bytes, ProxyError> {
-    // just in case empty body check
-    if body.is_empty() {
-        return Ok(body);
-    }
-
-    // Read all the body as a json, it should be a json
-    let mut json: Value = serde_json::from_slice(&body)
-        .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
-
+) -> Result<(), ProxyError> {
     // if we can get a mutable json hashmap, go ahead
     if let Some(obj) = json.as_object_mut() {
         // Model override
@@ -493,10 +494,7 @@ async fn modify_json_payload(
         debug!("[MODIFY] 🔧 Modified JSON payload");
     }
 
-    let modified_json = serde_json::to_vec(&json)
-        .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
-
-    Ok(Bytes::from(modified_json))
+    Ok(())
 }
 
 /// Stream response handler, will send the proxied request response as it arrives
@@ -838,8 +836,7 @@ pub async fn embeddings_handler(
         }
     };
 
-    let mut json: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
+    let mut json = parse_json_body(body_bytes)?;
 
     let model_name = state.vllm_overrides.model_name.clone();
 
@@ -869,10 +866,9 @@ pub async fn embeddings_handler(
         }
     }
 
-    let modified_json = serde_json::to_vec(&json)
-        .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
+    let modified_json = serialize_json_body(&json)?;
 
-    forward_json_request(&state, "v1/embeddings", headers, Bytes::from(modified_json)).await
+    forward_json_request(&state, "v1/embeddings", headers, modified_json).await
 }
 
 /// Validates a rerank/score request body and applies the model override.
@@ -894,8 +890,7 @@ async fn prepare_rerank_request(
         }
     };
 
-    let mut json: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
+    let mut json = parse_json_body(body_bytes)?;
 
     let model_name = state.vllm_overrides.model_name.clone();
 
@@ -915,10 +910,9 @@ async fn prepare_rerank_request(
         }
     }
 
-    let modified_json = serde_json::to_vec(&json)
-        .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
+    let modified_json = serialize_json_body(&json)?;
 
-    Ok((headers, Bytes::from(modified_json)))
+    Ok((headers, modified_json))
 }
 
 /// Rerank handler: validates document count and proxies to backend.
@@ -953,4 +947,50 @@ pub fn not_found_response() -> AxumResponse {
         message: "Not found".to_string(),
     };
     (StatusCode::NOT_FOUND, axum::Json(error_response)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_json_without_content_type() {
+        let json = parse_json_body(Bytes::from_static(br#"{"model":"client-value"}"#)).unwrap();
+        assert_eq!(json["model"], "client-value");
+    }
+
+    #[test]
+    fn rejects_empty_and_non_json_bodies() {
+        for body in [
+            &b""[..],
+            b"not json",
+            b"{",
+            b"{} trailing",
+            b"[] []",
+            b"\xff\xfe",
+        ] {
+            assert!(
+                parse_json_body(Bytes::copy_from_slice(body)).is_err(),
+                "body should be rejected: {:?}",
+                body
+            );
+        }
+    }
+
+    #[test]
+    fn reserializes_only_the_parsed_object() {
+        let json =
+            parse_json_body(Bytes::from_static(b"{ \"b\": 2, \"a\": 1, \"a\": 3 }")).unwrap();
+        let serialized = serialize_json_body(&json).unwrap();
+
+        assert_eq!(serialized.as_ref(), br#"{"a":3,"b":2}"#);
+    }
+
+    #[test]
+    fn completion_paths_are_modified_independently_of_headers() {
+        assert!(should_modify_request(&Method::POST, "chat/completions"));
+        assert!(should_modify_request(&Method::POST, "completions"));
+        assert!(!should_modify_request(&Method::GET, "chat/completions"));
+        assert!(!should_modify_request(&Method::POST, "embeddings"));
+    }
 }

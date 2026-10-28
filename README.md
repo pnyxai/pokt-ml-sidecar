@@ -28,6 +28,7 @@ The main features of this app are:
 - **Rerank endpoint** (`/v1/rerank`): Validates the number of `documents` against an optional `max_rerank_documents` config limit.
 - **OpenAI-compatible models endpoint** (`/v1/models`): Returns a static models list with the configured `model_public_name`.
 - **Engine role allowlist**: Only the endpoints for the configured engine role are exposed. Requests are matched on the decoded, normalized path; path traversal, `%2F`, `%5C`, `//`, and any other percent-encoded path are rejected with `404`.
+- **Content-Type independent JSON bodies**: Every `POST` body is parsed as JSON regardless of the inbound `Content-Type`. Empty or malformed bodies return `400`, and only the re-serialized JSON is forwarded upstream.
 - **Health check** (`/health`): Probes the backend `/health` endpoint with a 3-second timeout and returns `{"status": "healthy"}` on success.
 
 
