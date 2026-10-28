@@ -1,6 +1,24 @@
+use crate::policy::EngineRole;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct EngineConfig {
+    #[serde(default)]
+    pub role: EngineRole,
+    #[serde(default)]
+    pub serve_completions: bool,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            role: EngineRole::Chat,
+            serve_completions: false,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerConfig {
@@ -36,6 +54,8 @@ pub struct ModelConfig {
 pub struct Config {
     pub log_level: String,
     pub server: ServerConfig,
+    #[serde(default)]
+    pub engine: EngineConfig,
     pub vllm_backend: VllmProxyConfig,
     pub routing: RoutingConfig,
     pub model_config_data: ModelConfig,

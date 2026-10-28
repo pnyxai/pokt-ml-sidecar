@@ -1,6 +1,14 @@
 # Set the loglevel (debug/info/error)
 log_level: "debug"
 
+# Which engine this sidecar fronts. Only the endpoints for this role are
+# exposed; every other /v1 path or method returns 404.
+engine:
+  # One of: chat, embedding, reranker
+  role: chat
+  # Legacy /v1/completions is only exposed when explicitly enabled here
+  serve_completions: false
+
 # Configuration of the poncho server
 server:
   # Use 0.0.0.0 to expose the poncho app

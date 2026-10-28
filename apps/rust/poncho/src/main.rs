@@ -1,16 +1,22 @@
 mod config;
 mod pocket;
+mod policy;
 mod proxy;
 
-use axum::{routing::{any, get, post}, Router};
+use axum::{
+    middleware,
+    routing::{any, get, post},
+    Router,
+};
 use log::info;
 use reqwest::Client;
 use std::{sync::Arc, time::Duration};
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 
-use config::Config;
+use config::{Config, EngineConfig};
 use pocket::PoktModelData;
 use pocket::PoktState;
+use policy::RoutePolicy;
 use proxy::ProxyState;
 use proxy::VllmOverrides;
 
@@ -40,6 +46,13 @@ async fn main() {
     info!("[STARTUP]    Host: {}", config.server.host);
     info!("[STARTUP]    Port: {}", config.server.port);
     info!("[STARTUP] ");
+    info!("[STARTUP] 🎭 Engine Configuration:");
+    info!("[STARTUP]    Role: {:?}", config.engine.role);
+    info!(
+        "[STARTUP]    Serve Completions: {}",
+        config.engine.serve_completions
+    );
+    info!("[STARTUP] ");
     info!("[STARTUP] 🔗 VLLM Backend Configuration:");
     info!("[STARTUP]    Host: {}", config.vllm_backend.host);
     info!("[STARTUP]    Port: {}", config.vllm_backend.port);
@@ -47,7 +60,10 @@ async fn main() {
         "[STARTUP]    Model Name Override: {}",
         config.vllm_backend.model_name_override
     );
-    info!("[STARTUP]    Allow Logprobs: {}", config.vllm_backend.allow_logprobs);
+    info!(
+        "[STARTUP]    Allow Logprobs: {}",
+        config.vllm_backend.allow_logprobs
+    );
     info!(
         "[STARTUP]    Crop Max Tokens: {}",
         config.vllm_backend.crop_max_tokens
@@ -62,7 +78,10 @@ async fn main() {
     );
     info!("[STARTUP] ");
     info!("[STARTUP] ⏱️  Routing Configuration:");
-    info!("[STARTUP]    Timeout (seconds): {}", config.routing.timeout_seconds);
+    info!(
+        "[STARTUP]    Timeout (seconds): {}",
+        config.routing.timeout_seconds
+    );
     info!(
         "[STARTUP]    Max Payload Size (MB): {}",
         config.routing.max_payload_size_mb
@@ -110,6 +129,7 @@ async fn main() {
             max_tokens: config.model_config_data.max_tokens.to_string(),
             model_public_name: config.model_config_data.model_public_name,
         },
+        config.engine,
     )
     .await;
 }
@@ -123,6 +143,7 @@ async fn run_server(
     max_payload_size_mb: usize,
     vllm_overrides: VllmOverrides,
     model_config: PoktModelData,
+    engine: EngineConfig,
 ) {
     // Simple HTTP1 client
     let client = Client::builder()
@@ -151,6 +172,7 @@ async fn run_server(
         max_payload_size_mb: max_payload_size_mb,
         timeout: tcp_timeout + 10, // 10 more seconds
         vllm_overrides: vllm_overrides,
+        route_policy: RoutePolicy::new(engine.role, engine.serve_completions),
     });
 
     let pokt_state = Arc::new(PoktState {
@@ -162,17 +184,21 @@ async fn run_server(
         .route("/*path", any(pocket::pokt_handler))
         .with_state(pokt_state);
 
+    let guard_state = porxy_state.clone();
+
     // Sets up the web application routing:
     let app = Router::new()
         .nest("/pokt", pokt_router)
         // Health check: probes the backend /health endpoint
         .route("/health", get(proxy::health_handler))
         // OpenAI-compatible models endpoint (static response)
-        .route("/v1/models", any(proxy::models_handler))
+        .route("/v1/models", get(proxy::models_handler))
         // Embeddings endpoint with batch size validation
         .route("/v1/embeddings", post(proxy::embeddings_handler))
         // Rerank endpoint with document count validation
         .route("/v1/rerank", post(proxy::rerank_handler))
+        // Score endpoint with the same validation as rerank
+        .route("/v1/score", post(proxy::score_handler))
         // Proxy all other v1/ paths to the backend
         .route("/v1/*path", any(proxy::proxy_handler))
         // Reject everything else with a JSON 404
@@ -182,6 +208,11 @@ async fn run_server(
         // Limits request body size to 10 megabytes
         .layer(RequestBodyLimitLayer::new(
             max_payload_size_mb * 1024 * 1024,
+        ))
+        // Enforces the role-based path/method allowlist before anything else
+        .layer(middleware::from_fn_with_state(
+            guard_state,
+            proxy::v1_path_guard,
         ))
         // Makes the shared client available to handlers
         .with_state(porxy_state);
@@ -195,7 +226,10 @@ async fn run_server(
 
     // Log if success
     if let Ok(socket) = listener.local_addr() {
-        info!("[STARTUP] High-performance proxy server running on {}", socket);
+        info!(
+            "[STARTUP] High-performance proxy server running on {}",
+            socket
+        );
         info!("[STARTUP] Worker threads: 8 (configured)");
         info!("[STARTUP] Ready to handle high traffic loads...");
     }

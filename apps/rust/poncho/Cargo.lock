@@ -951,6 +951,7 @@ dependencies = [
  "axum",
  "env_logger",
  "log",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",

@@ -27,7 +27,21 @@ The main features of this app are:
 - **Embeddings endpoint** (`/v1/embeddings`): Accepts both OpenAI-style `input` and vLLM-style `texts` arrays. Validates batch size against an optional `max_batched_texts_embedding` config limit.
 - **Rerank endpoint** (`/v1/rerank`): Validates the number of `documents` against an optional `max_rerank_documents` config limit.
 - **OpenAI-compatible models endpoint** (`/v1/models`): Returns a static models list with the configured `model_public_name`.
+- **Engine role allowlist**: Only the endpoints for the configured engine role are exposed. Requests are matched on the decoded, normalized path; path traversal, `%2F`, `%5C`, `//`, and any other percent-encoded path are rejected with `404`.
 - **Health check** (`/health`): Probes the backend `/health` endpoint with a 3-second timeout and returns `{"status": "healthy"}` on success.
+
+
+### Engine roles
+
+Configure `engine.role` as `chat`, `embedding`, or `reranker`:
+
+| Role | Allowed `/v1` endpoints |
+|------|--------------------------|
+| `chat` | `GET /v1/models`, `POST /v1/chat/completions`, and `POST /v1/completions` only when `engine.serve_completions: true` |
+| `embedding` | `GET /v1/models`, `POST /v1/embeddings` |
+| `reranker` | `GET /v1/models`, `POST /v1/rerank`, `POST /v1/score` |
+
+Anything else under `/v1`, including `/v1/responses`, `/v1/messages`, `*/render`, and `/v1/load_lora_adapter`, returns a JSON `404`.
 
 
 ### Endpoints
@@ -35,10 +49,12 @@ The main features of this app are:
 | Route | Method | Description |
 |-------|--------|-------------|
 | `/health` | `GET` | Probes backend health, returns `{"status": "healthy"}` |
-| `/v1/models` | `any` | Static OpenAI-compatible models list (showing only the overridden model name) |
-| `/v1/embeddings` | `POST` | Embeddings with batch size validation & model override |
-| `/v1/rerank` | `POST` | Rerank with document count validation & model override |
-| `/v1/*` | `any` | Proxy everything else to the vLLM backend |
+| `/v1/models` | `GET` | Static OpenAI-compatible models list (showing only the overridden model name) |
+| `/v1/chat/completions` | `POST` | Chat completions proxy (chat role) |
+| `/v1/completions` | `POST` | Legacy completions proxy (chat role, only when `serve_completions` is enabled) |
+| `/v1/embeddings` | `POST` | Embeddings with batch size validation & model override (embedding role) |
+| `/v1/rerank` | `POST` | Rerank with document count validation & model override (reranker role) |
+| `/v1/score` | `POST` | Score with rerank-style validation & model override (reranker role) |
 | `/pokt/*` | `any` | Pocket-specific endpoints (see below) |
 | anything else | `any` | Returns JSON `404` |
 
