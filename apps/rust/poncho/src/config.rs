@@ -1,3 +1,4 @@
+use crate::media::MediaConfig;
 use crate::policy::EngineRole;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -56,6 +57,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub engine: EngineConfig,
+    #[serde(default)]
+    pub media: MediaConfig,
     pub vllm_backend: VllmProxyConfig,
     pub routing: RoutingConfig,
     pub model_config_data: ModelConfig,

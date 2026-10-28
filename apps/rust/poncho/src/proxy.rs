@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use tokio_stream::StreamExt;
 
+use crate::media::MediaConfig;
 use crate::policy::{canonicalize_path, RoutePolicy};
 
 #[derive(Clone)]
@@ -48,6 +49,7 @@ pub struct ProxyState {
     pub timeout: u64,
     pub vllm_overrides: VllmOverrides,
     pub route_policy: RoutePolicy,
+    pub media: MediaConfig,
 }
 
 #[derive(Debug)]
@@ -212,6 +214,7 @@ pub async fn proxy_handler(
             if let Err(e) = modify_json_payload(
                 &mut json,
                 &path,
+                &state.media,
                 state.vllm_overrides.clone(),
                 target_url,
                 &state.client,
@@ -511,6 +514,7 @@ fn validate_token_limits(
 async fn modify_json_payload(
     json: &mut Value,
     path: &str,
+    media: &MediaConfig,
     vllm_overrides: VllmOverrides,
     target_url: String,
     client: &Client,
@@ -539,6 +543,7 @@ async fn modify_json_payload(
     validate_completions_prompt(path, obj)?;
     validate_finite_range(obj, "temperature", 0.0, 2.0)?;
     validate_finite_range(obj, "top_p", 0.0, 1.0)?;
+    crate::media::validate_and_sanitize(obj, media).map_err(ProxyError::Validation)?;
 
     let token_state = validate_token_limits(obj, &vllm_overrides)?;
 

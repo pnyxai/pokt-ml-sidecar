@@ -1,4 +1,5 @@
 mod config;
+mod media;
 mod pocket;
 mod policy;
 mod proxy;
@@ -14,6 +15,7 @@ use std::{sync::Arc, time::Duration};
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 
 use config::{Config, EngineConfig};
+use media::MediaConfig;
 use pocket::PoktModelData;
 use pocket::PoktState;
 use policy::RoutePolicy;
@@ -52,6 +54,15 @@ async fn main() {
         "[STARTUP]    Serve Completions: {}",
         config.engine.serve_completions
     );
+    info!("[STARTUP] ");
+    info!("[STARTUP] 🖼️  Media Configuration:");
+    info!(
+        "[STARTUP]    Limits per request (image/audio/video): {}/{}/{}",
+        config.media.limit_mm_per_prompt.image,
+        config.media.limit_mm_per_prompt.audio,
+        config.media.limit_mm_per_prompt.video
+    );
+    info!("[STARTUP]    Video Enabled: {}", config.media.allow_video);
     info!("[STARTUP] ");
     info!("[STARTUP] 🔗 VLLM Backend Configuration:");
     info!("[STARTUP]    Host: {}", config.vllm_backend.host);
@@ -130,6 +141,7 @@ async fn main() {
             model_public_name: config.model_config_data.model_public_name,
         },
         config.engine,
+        config.media,
     )
     .await;
 }
@@ -144,6 +156,7 @@ async fn run_server(
     vllm_overrides: VllmOverrides,
     model_config: PoktModelData,
     engine: EngineConfig,
+    media: MediaConfig,
 ) {
     // Simple HTTP1 client
     let client = Client::builder()
@@ -173,6 +186,7 @@ async fn run_server(
         timeout: tcp_timeout + 10, // 10 more seconds
         vllm_overrides: vllm_overrides,
         route_policy: RoutePolicy::new(engine.role, engine.serve_completions),
+        media,
     });
 
     let pokt_state = Arc::new(PoktState {

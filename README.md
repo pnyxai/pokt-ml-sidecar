@@ -29,6 +29,8 @@ The main features of this app are:
 - **OpenAI-compatible models endpoint** (`/v1/models`): Returns a static models list with the configured `model_public_name`.
 - **Engine role allowlist**: Only the endpoints for the configured engine role are exposed. Requests are matched on the decoded, normalized path; path traversal, `%2F`, `%5C`, `//`, and any other percent-encoded path are rejected with `404`.
 - **Content-Type independent JSON bodies**: Every `POST` body is parsed as JSON regardless of the inbound `Content-Type`. Empty or malformed bodies return `400`, and only the re-serialized JSON is forwarded upstream.
+- **Generation parameter validation**: `max_tokens` and `max_completion_tokens` must be positive integers and are capped by `model_config_data.max_tokens` (or rejected when `crop_max_tokens` is disabled). `temperature` must be finite and between `0` and `2`; `top_p` must be finite and between `0` and `1`. For `/v1/completions`, `prompt` must be a single string.
+- **Multimodal media validation**: `image_url`, `input_audio`, and optionally `video_url` parts are accepted only as inline base64 data. Declared MIME types are ignored; decoded magic bytes must be PNG/JPEG/WEBP for images, WAV/FLAC/MP3 for audio, and MP4/WebM for video when enabled. Per-item byte limits, per-request counts, image dimensions, and audio duration are enforced. Client-supplied `uuid` fields are stripped (GHSA-p92p).
 - **Health check** (`/health`): Probes the backend `/health` endpoint with a 3-second timeout and returns `{"status": "healthy"}` on success.
 
 
@@ -43,6 +45,34 @@ Configure `engine.role` as `chat`, `embedding`, or `reranker`:
 | `reranker` | `GET /v1/models`, `POST /v1/rerank`, `POST /v1/score` |
 
 Anything else under `/v1`, including `/v1/responses`, `/v1/messages`, `*/render`, and `/v1/load_lora_adapter`, returns a JSON `404`.
+
+
+### Media inputs
+
+Media is rejected by default. Set `media.limit_mm_per_prompt` to the same values used by the engine's `--limit-mm-per-prompt` configuration:
+
+```yaml
+media:
+  allow_video: false
+  limit_mm_per_prompt:
+    image: 4
+    audio: 1
+    video: 0
+  max_item_bytes:
+    image: 5242880
+    audio: 5242880
+    video: 5242880
+  max_image_width: 8192
+  max_image_height: 8192
+  max_audio_duration_seconds: 600
+```
+
+- Only inline `data:` base64 URIs are accepted; `http:`, `https:`, `file:`, and all other schemes are rejected.
+- Images must be PNG, JPEG, or WEBP. Audio must be WAV, FLAC, or MP3. Video (when enabled) must be MP4 or WebM.
+- Magic bytes are authoritative; declared MIME types are ignored. EPS, PostScript, PDF, TIFF, and unknown content are rejected.
+- `input_audio` accepts OpenAI's `{ "data": ..., "format": ... }` form or a `data:` URL and is normalized to `data` + detected format.
+- Per-item bytes, per-request item counts, image dimensions, and audio duration are enforced.
+- `uuid` fields on content parts are removed before forwarding (GHSA-p92p).
 
 
 ### Endpoints
