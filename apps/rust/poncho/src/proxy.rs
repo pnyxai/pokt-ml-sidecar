@@ -211,6 +211,7 @@ pub async fn proxy_handler(
             debug!("[MODIFY] 🔧 Modifying request body...");
             if let Err(e) = modify_json_payload(
                 &mut json,
+                &path,
                 state.vllm_overrides.clone(),
                 target_url,
                 &state.client,
@@ -383,116 +384,239 @@ fn should_modify_request(method: &Method, path: &str) -> bool {
     method == Method::POST && matches!(path, "chat/completions" | "completions")
 }
 
-/// Modifies the json payload of a vllm request, overriding the model name and
-/// raising an error if logprobs are requested but not allowed
+/// Validates an optional numeric field against an inclusive range.
+///
+/// The field is accepted when absent, or when present as a finite JSON number
+/// within `min..=max`. Strings, booleans, `null`, arrays, objects, non-finite
+/// values, and out-of-range values are rejected.
+fn validate_finite_range(
+    obj: &serde_json::Map<String, Value>,
+    field: &str,
+    min: f64,
+    max: f64,
+) -> Result<(), ProxyError> {
+    if let Some(value) = obj.get(field) {
+        let number = value.as_f64().ok_or_else(|| {
+            ProxyError::Validation(format!(
+                "{} must be a finite number between {} and {}",
+                field, min, max
+            ))
+        })?;
+
+        if !number.is_finite() || number < min || number > max {
+            return Err(ProxyError::Validation(format!(
+                "{} must be a finite number between {} and {}",
+                field, min, max
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Enforces the legacy completions prompt shape.
+///
+/// For `/v1/completions` only, `prompt` must be present and be a single JSON
+/// string. Other endpoints are unaffected.
+fn validate_completions_prompt(
+    path: &str,
+    obj: &serde_json::Map<String, Value>,
+) -> Result<(), ProxyError> {
+    if path != "completions" {
+        return Ok(());
+    }
+
+    match obj.get("prompt") {
+        Some(Value::String(_)) => Ok(()),
+        Some(_) => Err(ProxyError::Validation(
+            "prompt must be a single string".to_string(),
+        )),
+        None => Err(ProxyError::Validation(
+            "prompt is required and must be a single string".to_string(),
+        )),
+    }
+}
+
+/// Summary of the validated generation-limit fields in a request.
+#[derive(Debug)]
+struct TokenLimitState {
+    /// Names of the token-limit fields present in the request.
+    fields: Vec<&'static str>,
+    /// Whether at least one requested value exceeded the configured cap.
+    limit_exceed: bool,
+    /// Whether the request did not specify any token limit.
+    no_limit: bool,
+    /// Smallest requested limit after capping, or zero when no limit was given.
+    tokens_req: u64,
+}
+
+/// Validates and caps `max_tokens` / `max_completion_tokens`.
+///
+/// Each field that is present must be a positive integer. Values above
+/// `vllm_overrides.max_tokens` are clamped in place when `crop_max_tokens` is
+/// enabled, and rejected otherwise. The returned state tells the caller
+/// whether context-aware adjustment is still required.
+fn validate_token_limits(
+    obj: &mut serde_json::Map<String, Value>,
+    vllm_overrides: &VllmOverrides,
+) -> Result<TokenLimitState, ProxyError> {
+    let fields: Vec<&'static str> = ["max_tokens", "max_completion_tokens"]
+        .into_iter()
+        .filter(|field| obj.contains_key(*field))
+        .collect();
+
+    let mut limit_exceed = false;
+
+    for field in &fields {
+        let value = obj
+            .get(*field)
+            .and_then(|value| value.as_u64())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                ProxyError::Validation(format!("{} must be a positive integer", field))
+            })?;
+
+        if value > vllm_overrides.max_tokens {
+            if !vllm_overrides.crop_max_tokens {
+                return Err(ProxyError::Validation(format!(
+                    "This model's maximum context length is {} tokens. However, you requested {} tokens (plus input tokens).",
+                    vllm_overrides.max_tokens, value
+                )));
+            }
+
+            limit_exceed = true;
+            obj.insert((*field).to_string(), Value::from(vllm_overrides.max_tokens));
+        }
+    }
+
+    let tokens_req = fields
+        .iter()
+        .filter_map(|field| obj.get(*field).and_then(|value| value.as_u64()))
+        .min()
+        .unwrap_or(0);
+
+    Ok(TokenLimitState {
+        no_limit: fields.is_empty(),
+        fields,
+        limit_exceed,
+        tokens_req,
+    })
+}
+
+/// Validates and rewrites a chat/completions request payload.
+///
+/// The model name is overridden, disallowed logprobs are rejected, generation
+/// parameters are validated, and token limits are capped. The completions path
+/// additionally requires a single string `prompt`.
 async fn modify_json_payload(
     json: &mut Value,
+    path: &str,
     vllm_overrides: VllmOverrides,
     target_url: String,
     client: &Client,
 ) -> Result<(), ProxyError> {
-    // if we can get a mutable json hashmap, go ahead
-    if let Some(obj) = json.as_object_mut() {
-        // Model override
-        if obj.contains_key("model") {
-            obj.insert(
-                "model".to_string(),
-                Value::String(vllm_overrides.model_name.clone()),
-            );
-        }
+    let obj = json
+        .as_object_mut()
+        .ok_or_else(|| ProxyError::Validation("Request body must be a JSON object".to_string()))?;
 
-        // Check for logprobs
-        if (obj.contains_key("logprobs") || obj.contains_key("prompt_logprobs"))
-            && !vllm_overrides.allow_logprobs
-        {
+    // Model override
+    if obj.contains_key("model") {
+        obj.insert(
+            "model".to_string(),
+            Value::String(vllm_overrides.model_name.clone()),
+        );
+    }
+
+    // Check for logprobs
+    if (obj.contains_key("logprobs") || obj.contains_key("prompt_logprobs"))
+        && !vllm_overrides.allow_logprobs
+    {
+        return Err(ProxyError::Validation(
+            "logprobs parameter is not allowed must be omitted".to_string(),
+        ));
+    }
+
+    validate_completions_prompt(path, obj)?;
+    validate_finite_range(obj, "temperature", 0.0, 2.0)?;
+    validate_finite_range(obj, "top_p", 0.0, 1.0)?;
+
+    let token_state = validate_token_limits(obj, &vllm_overrides)?;
+
+    if token_state.tokens_req > 0 {
+        debug!(
+            "[MODIFY] 🔍 Found requested {} tokens of a max of {}. Is exceding limit? : {}",
+            token_state.tokens_req, vllm_overrides.max_tokens, token_state.limit_exceed
+        );
+    }
+
+    let needs_context_adjustment = token_state.no_limit
+        || (vllm_overrides.crop_max_tokens
+            && token_state.limit_exceed
+            && obj.contains_key("messages"));
+
+    if needs_context_adjustment {
+        // Get input tokens
+        debug!("[MODIFY] 🔍 Requesting input tokens count.");
+        let mut input_tokens: u64 = 0;
+        if let Some(in_message) = obj.get("messages") {
+            // Create a new call, requesting one token, using the incomming request message
+            let body = serde_json::json!({
+                "messages": in_message.clone(),  // Clone the array directly
+                "model": Value::String(vllm_overrides.model_name.clone()),
+                // TODO: Add tools field
+                "max_tokens": 1
+            });
+            // Call the model to get input tokens
+            let response = client.post(&target_url).json(&body).send().await?;
+            // Read
+            let data: Response = response.json().await?;
+            // Get input tokens
+            input_tokens = data.usage.prompt_tokens;
+
+            debug!("[MODIFY]  Counted {} input tokens", input_tokens)
+        }
+        if input_tokens == 0 {
             return Err(ProxyError::Validation(
-                "logprobs parameter is not allowed must be omitted".to_string(),
+                "Unable to get total input tokens.".to_string(),
             ));
         }
+        // Add a max completitions field to respect the max tokens override we set
+        if input_tokens < vllm_overrides.max_position_embeddings {
+            // Get available tokens from model length
+            let available_tokens = vllm_overrides.max_position_embeddings - input_tokens;
+            // Check if the context length is limmiting the generation
+            let max_completion = available_tokens.min(vllm_overrides.max_tokens);
+            let target_completion = if token_state.no_limit {
+                max_completion
+            } else {
+                token_state.tokens_req.min(max_completion)
+            };
 
-        let mut limit_exceed: bool = false;
-        let mut no_limit: bool = false;
-        let mut tokens_req: u64 = 0;
-        // Check for max_tokens
-        if let Some(max_tokens) = obj.get("max_tokens") {
-            if let Some(max_tokens_val) = max_tokens.as_u64() {
-                if max_tokens_val > vllm_overrides.max_tokens {
-                    limit_exceed = true;
-                }
-                tokens_req = max_tokens_val;
-            }
-        // Check for max_completion_tokens
-        } else if let Some(max_tokens) = obj.get("max_completion_tokens") {
-            if let Some(max_tokens_val) = max_tokens.as_u64() {
-                if max_tokens_val > vllm_overrides.max_tokens {
-                    limit_exceed = true;
-                }
-                tokens_req = max_tokens_val;
-            }
-        } else {
-            // No field requesting generation limit, so, we need to limit this
-            no_limit = true;
-        }
-        if tokens_req > 0 {
-            debug!(
-                "[MODIFY] 🔍 Found requested {} tokens of a max of {}. Is exceding limit? : {}",
-                tokens_req, vllm_overrides.max_tokens, limit_exceed
-            );
-        }
-
-        if (vllm_overrides.crop_max_tokens && limit_exceed) || no_limit {
-            // Get input tokens
-            debug!("[MODIFY] 🔍 Requesting input tokens count.");
-            let mut input_tokens: u64 = 0;
-            if let Some(in_message) = obj.get("messages") {
-                // Create a new call, requesting one token, using the incomming request message
-                let body = serde_json::json!({
-                    "messages": in_message.clone(),  // Clone the array directly
-                    "model": Value::String(vllm_overrides.model_name.clone()),
-                    // TODO: Add tools field
-                    "max_tokens": 1
-                });
-                // Call the model to get input tokens
-                let response = client.post(&target_url).json(&body).send().await?;
-                // Read
-                let data: Response = response.json().await?;
-                // Get input tokens
-                input_tokens = data.usage.prompt_tokens;
-
-                debug!("[MODIFY]  Counted {} input tokens", input_tokens)
-            }
-            if input_tokens == 0 {
-                return Err(ProxyError::Validation(format!(
-                    "Unable to get total input tokens."
-                )));
-            }
-            // Add a max completitions field to respect the max tokens override we set
-            if (vllm_overrides.max_position_embeddings - input_tokens) > 0 {
-                // Get available tokens from model length
-                let available_tokens = vllm_overrides.max_position_embeddings - input_tokens;
-                // Check if the context length is limmiting the generation
-                let max_completion = if available_tokens < vllm_overrides.max_tokens {
-                    available_tokens
-                } else {
-                    vllm_overrides.max_tokens
-                };
+            if token_state.fields.is_empty() {
                 obj.insert(
                     "max_completion_tokens".to_string(),
-                    Value::from(max_completion),
+                    Value::from(target_completion),
                 );
             } else {
-                return Err(ProxyError::Validation(
-                    "Number of input tokens exceed the model's maximum allowed tokens.".to_string(),
-                ));
+                for field in &token_state.fields {
+                    let current = obj
+                        .get(*field)
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(target_completion);
+                    obj.insert(
+                        (*field).to_string(),
+                        Value::from(current.min(target_completion)),
+                    );
+                }
             }
-        } else if limit_exceed {
+        } else {
             return Err(ProxyError::Validation(
-                    format!("This model's maximum context length is {} tokens. However, you requested {} tokens (plus input tokens).", vllm_overrides.max_tokens, tokens_req)
-                ));
+                "Number of input tokens exceed the model's maximum allowed tokens.".to_string(),
+            ));
         }
-
-        debug!("[MODIFY] 🔧 Modified JSON payload");
     }
+
+    debug!("[MODIFY] 🔧 Modified JSON payload");
 
     Ok(())
 }
@@ -952,6 +1076,158 @@ pub fn not_found_response() -> AxumResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_overrides(max_tokens: u64, crop_max_tokens: bool) -> VllmOverrides {
+        VllmOverrides {
+            model_name: "backend-model".to_string(),
+            allow_logprobs: false,
+            crop_max_tokens,
+            max_tokens,
+            max_position_embeddings: 4096,
+            overriden_name: "public-model".to_string(),
+            max_batched_texts_embedding: None,
+            max_rerank_documents: None,
+        }
+    }
+
+    fn object(value: Value) -> serde_json::Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn max_tokens_must_be_a_positive_integer() {
+        for value in [
+            serde_json::json!({"max_tokens": 0}),
+            serde_json::json!({"max_tokens": -1}),
+            serde_json::json!({"max_tokens": 1.5}),
+            serde_json::json!({"max_tokens": "10"}),
+            serde_json::json!({"max_tokens": null}),
+            serde_json::json!({"max_completion_tokens": 0}),
+            serde_json::json!({"max_completion_tokens": -1}),
+            serde_json::json!({"max_completion_tokens": 1.5}),
+            serde_json::json!({"max_completion_tokens": "10"}),
+            serde_json::json!({"max_completion_tokens": null}),
+        ] {
+            let mut obj = object(value);
+            assert!(
+                validate_token_limits(&mut obj, &test_overrides(100, true)).is_err(),
+                "value should be rejected: {:?}",
+                obj
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_token_limits_are_capped_when_crop_enabled() {
+        let mut obj = object(serde_json::json!({
+            "max_tokens": 50,
+            "max_completion_tokens": 500
+        }));
+
+        let state = validate_token_limits(&mut obj, &test_overrides(100, true)).unwrap();
+
+        assert_eq!(obj["max_tokens"], 50);
+        assert_eq!(obj["max_completion_tokens"], 100);
+        assert!(state.limit_exceed);
+        assert!(!state.no_limit);
+        assert_eq!(state.tokens_req, 50);
+    }
+
+    #[test]
+    fn oversized_token_limits_are_rejected_without_crop() {
+        for value in [
+            serde_json::json!({"max_tokens": 500}),
+            serde_json::json!({"max_completion_tokens": 500}),
+        ] {
+            let mut obj = object(value);
+            assert!(
+                validate_token_limits(&mut obj, &test_overrides(100, false)).is_err(),
+                "value should be rejected: {:?}",
+                obj
+            );
+        }
+    }
+
+    #[test]
+    fn sampling_params_must_be_finite_and_in_range() {
+        assert!(validate_finite_range(
+            &object(serde_json::json!({"temperature": 0.0})),
+            "temperature",
+            0.0,
+            2.0
+        )
+        .is_ok());
+        assert!(validate_finite_range(
+            &object(serde_json::json!({"temperature": 2})),
+            "temperature",
+            0.0,
+            2.0
+        )
+        .is_ok());
+        assert!(validate_finite_range(
+            &object(serde_json::json!({"top_p": 0.0})),
+            "top_p",
+            0.0,
+            1.0
+        )
+        .is_ok());
+        assert!(
+            validate_finite_range(&object(serde_json::json!({"top_p": 1})), "top_p", 0.0, 1.0)
+                .is_ok()
+        );
+
+        for value in [
+            serde_json::json!({"temperature": -0.1}),
+            serde_json::json!({"temperature": 2.1}),
+            serde_json::json!({"temperature": "1"}),
+            serde_json::json!({"temperature": null}),
+            serde_json::json!({"top_p": -0.1}),
+            serde_json::json!({"top_p": 1.1}),
+            serde_json::json!({"top_p": "1"}),
+            serde_json::json!({"top_p": null}),
+            serde_json::json!({"temperature": 1e308}),
+        ] {
+            let field = if value.get("temperature").is_some() {
+                ("temperature", 0.0, 2.0)
+            } else {
+                ("top_p", 0.0, 1.0)
+            };
+            let obj = object(value);
+            assert!(
+                validate_finite_range(&obj, field.0, field.1, field.2).is_err(),
+                "value should be rejected: {:?}",
+                obj
+            );
+        }
+    }
+
+    #[test]
+    fn completions_prompt_must_be_a_single_string() {
+        assert!(validate_completions_prompt(
+            "completions",
+            &object(serde_json::json!({"prompt": "hello"}))
+        )
+        .is_ok());
+
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"prompt": ["hello"]}),
+            serde_json::json!({"prompt": null}),
+            serde_json::json!({"prompt": 1}),
+            serde_json::json!({"prompt": {"text": "hello"}}),
+        ] {
+            assert!(
+                validate_completions_prompt("completions", &object(value)).is_err(),
+                "prompt should be rejected"
+            );
+        }
+
+        assert!(validate_completions_prompt(
+            "chat/completions",
+            &object(serde_json::json!({"messages": []}))
+        )
+        .is_ok());
+    }
 
     #[test]
     fn parses_valid_json_without_content_type() {
