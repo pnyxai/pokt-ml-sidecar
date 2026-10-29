@@ -880,6 +880,103 @@ pub async fn health_handler(
     }
 }
 
+/// Validates an embeddings request body and applies the model override.
+///
+/// Only text input is accepted: `input` must be a string or an array of
+/// strings, and `texts` must be an array of strings. Token-id input (numbers,
+/// integer arrays) is rejected, which also blocks the negative-id PoC for
+/// GHSA-25q3-v2hm-8vpf.
+fn apply_embeddings_overrides(
+    json: &mut Value,
+    model_name: &str,
+    max_batched_texts: Option<usize>,
+) -> Result<(), ProxyError> {
+    let obj = json
+        .as_object_mut()
+        .ok_or_else(|| ProxyError::Validation("Request body must be a JSON object".to_string()))?;
+
+    obj.insert("model".to_string(), Value::String(model_name.to_string()));
+
+    let mut count = 0;
+
+    if let Some(texts) = obj.get("texts") {
+        let texts = texts.as_array().ok_or_else(|| {
+            ProxyError::Validation("texts must be an array of strings".to_string())
+        })?;
+        if !texts.iter().all(Value::is_string) {
+            return Err(ProxyError::Validation(
+                "texts must be an array of strings".to_string(),
+            ));
+        }
+        count = count.max(texts.len());
+    }
+
+    if let Some(input) = obj.get("input") {
+        let input_count = match input {
+            Value::String(_) => 1,
+            Value::Array(items) => {
+                if !items.iter().all(Value::is_string) {
+                    return Err(ProxyError::Validation(
+                        "input must be a string or an array of strings \
+                         (token-id input is not supported)"
+                            .to_string(),
+                    ));
+                }
+                items.len()
+            }
+            _ => {
+                return Err(ProxyError::Validation(
+                    "input must be a string or an array of strings \
+                     (token-id input is not supported)"
+                        .to_string(),
+                ));
+            }
+        };
+        count = count.max(input_count);
+    }
+
+    if let Some(max) = max_batched_texts {
+        if count > max {
+            return Err(ProxyError::Validation(format!(
+                "Too many texts for embedding: {} > maximum allowed {}",
+                count, max
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates a rerank/score request body and applies the model override.
+fn apply_rerank_overrides(
+    json: &mut Value,
+    model_name: &str,
+    max_rerank_documents: Option<usize>,
+) -> Result<(), ProxyError> {
+    let obj = json
+        .as_object_mut()
+        .ok_or_else(|| ProxyError::Validation("Request body must be a JSON object".to_string()))?;
+
+    obj.insert("model".to_string(), Value::String(model_name.to_string()));
+
+    if let Some(docs) = obj.get("documents") {
+        let docs = docs
+            .as_array()
+            .ok_or_else(|| ProxyError::Validation("documents must be an array".to_string()))?;
+        let count = docs.len();
+        if let Some(max) = max_rerank_documents {
+            if count > max {
+                return Err(ProxyError::Validation(format!(
+                    "Too many documents for rerank: {} > maximum allowed {}",
+                    count, max
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Forwards a JSON request to the backend and returns the response body.
 /// Used by embeddings and rerank handlers (no streaming).
 async fn forward_json_request(
@@ -967,33 +1064,11 @@ pub async fn embeddings_handler(
 
     let mut json = parse_json_body(body_bytes)?;
 
-    let model_name = state.vllm_overrides.model_name.clone();
-
-    if let Some(obj) = json.as_object_mut() {
-        obj.insert("model".to_string(), Value::String(model_name));
-
-        // Count texts / input
-        let count = if let Some(texts) = obj.get("texts").and_then(|v| v.as_array()) {
-            texts.len()
-        } else if let Some(input) = obj.get("input") {
-            if let Some(arr) = input.as_array() {
-                arr.len()
-            } else {
-                1
-            }
-        } else {
-            0
-        };
-
-        if let Some(max) = state.vllm_overrides.max_batched_texts_embedding {
-            if count > max {
-                return Err(ProxyError::Validation(format!(
-                    "Too many texts for embedding: {} > maximum allowed {}",
-                    count, max
-                )));
-            }
-        }
-    }
+    apply_embeddings_overrides(
+        &mut json,
+        &state.vllm_overrides.model_name,
+        state.vllm_overrides.max_batched_texts_embedding,
+    )?;
 
     let modified_json = serialize_json_body(&json)?;
 
@@ -1021,23 +1096,11 @@ async fn prepare_rerank_request(
 
     let mut json = parse_json_body(body_bytes)?;
 
-    let model_name = state.vllm_overrides.model_name.clone();
-
-    if let Some(obj) = json.as_object_mut() {
-        obj.insert("model".to_string(), Value::String(model_name));
-
-        if let Some(docs) = obj.get("documents").and_then(|v| v.as_array()) {
-            let count = docs.len();
-            if let Some(max) = state.vllm_overrides.max_rerank_documents {
-                if count > max {
-                    return Err(ProxyError::Validation(format!(
-                        "Too many documents for rerank: {} > maximum allowed {}",
-                        count, max
-                    )));
-                }
-            }
-        }
-    }
+    apply_rerank_overrides(
+        &mut json,
+        &state.vllm_overrides.model_name,
+        state.vllm_overrides.max_rerank_documents,
+    )?;
 
     let modified_json = serialize_json_body(&json)?;
 
@@ -1273,5 +1336,124 @@ mod tests {
         assert!(should_modify_request(&Method::POST, "completions"));
         assert!(!should_modify_request(&Method::GET, "chat/completions"));
         assert!(!should_modify_request(&Method::POST, "embeddings"));
+    }
+
+    #[test]
+    fn embeddings_rejects_non_object_bodies() {
+        for value in [
+            serde_json::json!([]),
+            serde_json::json!(["text"]),
+            serde_json::json!("text"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            let mut json = value.clone();
+            assert!(
+                matches!(
+                    apply_embeddings_overrides(&mut json, "backend-model", None),
+                    Err(ProxyError::Validation(_))
+                ),
+                "body should be rejected: {:?}",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn embeddings_rejects_token_id_input() {
+        for value in [
+            serde_json::json!({"input": [[-1, 1879]]}),
+            serde_json::json!({"input": [1, 2, 3]}),
+            serde_json::json!({"input": ["ok", 1]}),
+            serde_json::json!({"input": 123}),
+            serde_json::json!({"input": null}),
+            serde_json::json!({"texts": [1, 2]}),
+            serde_json::json!({"texts": "text"}),
+            serde_json::json!({"texts": [{"text": "x"}]}),
+        ] {
+            let mut json = value.clone();
+            assert!(
+                matches!(
+                    apply_embeddings_overrides(&mut json, "backend-model", None),
+                    Err(ProxyError::Validation(_))
+                ),
+                "input should be rejected: {:?}",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn embeddings_accepts_text_input_and_overrides_model() {
+        for value in [
+            serde_json::json!({"model": "client-model", "input": ["a", "b"]}),
+            serde_json::json!({"model": "client-model", "input": "a"}),
+            serde_json::json!({"model": "client-model", "texts": ["a"]}),
+        ] {
+            let mut json = value.clone();
+            apply_embeddings_overrides(&mut json, "backend-model", None).unwrap();
+            assert_eq!(json["model"], "backend-model");
+        }
+    }
+
+    #[test]
+    fn embeddings_enforces_batch_limit_for_both_shapes() {
+        for value in [
+            serde_json::json!({"input": ["a", "b", "c"]}),
+            serde_json::json!({"texts": ["a", "b", "c"]}),
+            serde_json::json!({"input": ["a"], "texts": ["a", "b", "c"]}),
+        ] {
+            let mut json = value.clone();
+            assert!(
+                matches!(
+                    apply_embeddings_overrides(&mut json, "backend-model", Some(2)),
+                    Err(ProxyError::Validation(_))
+                ),
+                "batch should exceed limit: {:?}",
+                value
+            );
+            assert!(apply_embeddings_overrides(&mut json, "backend-model", Some(3)).is_ok());
+        }
+    }
+
+    #[test]
+    fn rerank_rejects_non_object_bodies() {
+        for value in [
+            serde_json::json!([]),
+            serde_json::json!("text"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            let mut json = value.clone();
+            assert!(
+                matches!(
+                    apply_rerank_overrides(&mut json, "backend-model", None),
+                    Err(ProxyError::Validation(_))
+                ),
+                "body should be rejected: {:?}",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn rerank_overrides_model_and_enforces_document_limit() {
+        let mut json = serde_json::json!({
+            "model": "client-model",
+            "query": "q",
+            "documents": ["a", "b", "c"]
+        });
+        assert!(apply_rerank_overrides(&mut json, "backend-model", Some(2)).is_err());
+        apply_rerank_overrides(&mut json, "backend-model", Some(3)).unwrap();
+        assert_eq!(json["model"], "backend-model");
+    }
+
+    #[test]
+    fn rerank_rejects_non_array_documents() {
+        let mut json = serde_json::json!({"query": "q", "documents": "not-an-array"});
+        assert!(matches!(
+            apply_rerank_overrides(&mut json, "backend-model", None),
+            Err(ProxyError::Validation(_))
+        ));
     }
 }
