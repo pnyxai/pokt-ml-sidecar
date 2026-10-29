@@ -113,11 +113,8 @@ model_config_data:
 "#;
 
     fn parse(yaml: &str) -> Result<Config, String> {
-        let config: Config =
-            serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
-        config
-            .validate("test")
-            .map_err(|e| e.to_string())?;
+        let config: Config = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
+        config.validate("test").map_err(|e| e.to_string())?;
         Ok(config)
     }
 

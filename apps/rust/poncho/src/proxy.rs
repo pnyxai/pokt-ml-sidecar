@@ -587,14 +587,32 @@ fn validate_allowed_fields(
 /// Enforces that `n` is exactly 1 when present.
 fn validate_n(obj: &serde_json::Map<String, Value>) -> Result<(), ProxyError> {
     if let Some(value) = obj.get("n") {
-        let n = value.as_u64().ok_or_else(|| {
-            ProxyError::Validation("n must be a positive integer".to_string())
-        })?;
+        let n = value
+            .as_u64()
+            .ok_or_else(|| ProxyError::Validation("n must be a positive integer".to_string()))?;
         if n != 1 {
             return Err(ProxyError::Validation("n must be 1".to_string()));
         }
     }
     Ok(())
+}
+
+/// Returns true when the request needs a backend round-trip to count input
+/// tokens before the generation cap can be applied.
+///
+/// The legacy `/v1/completions` path never counts: it has no `messages` to send
+/// to the counting endpoint, so it gets the configured cap directly instead.
+fn should_count_input_tokens(
+    path: &str,
+    token_state: &TokenLimitState,
+    crop_max_tokens: bool,
+    has_messages: bool,
+) -> bool {
+    if path == "completions" {
+        return false;
+    }
+
+    token_state.no_limit || (crop_max_tokens && token_state.limit_exceed && has_messages)
 }
 
 /// Validates and rewrites a chat/completions request payload.
@@ -648,12 +666,19 @@ async fn modify_json_payload(
         );
     }
 
-    let needs_context_adjustment = token_state.no_limit
-        || (vllm_overrides.crop_max_tokens
-            && token_state.limit_exceed
-            && obj.contains_key("messages"));
-
-    if needs_context_adjustment {
+    if path == "completions" && token_state.no_limit {
+        // Legacy completions has no `messages` to count; apply the configured
+        // generation cap directly instead of failing on token counting.
+        obj.insert(
+            "max_tokens".to_string(),
+            Value::from(vllm_overrides.max_tokens),
+        );
+    } else if should_count_input_tokens(
+        path,
+        &token_state,
+        vllm_overrides.crop_max_tokens,
+        obj.contains_key("messages"),
+    ) {
         // Get input tokens
         debug!("[MODIFY] 🔍 Requesting input tokens count.");
         let mut input_tokens: u64 = 0;
@@ -1654,5 +1679,113 @@ mod tests {
         }
         assert!(validate_n(&object(serde_json::json!({"n": 1}))).is_ok());
         assert!(validate_n(&object(serde_json::json!({}))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn completions_without_limit_gets_configured_cap() {
+        let mut json = serde_json::json!({"model": "client-model", "prompt": "hello"});
+        modify_json_payload(
+            &mut json,
+            "completions",
+            &crate::media::MediaConfig::default(),
+            test_overrides(100, true),
+            "http://127.0.0.1:1/v1/completions".to_string(),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(json["max_tokens"], 100);
+    }
+
+    #[tokio::test]
+    async fn completions_without_limit_caps_even_without_crop() {
+        let mut json = serde_json::json!({"model": "client-model", "prompt": "hello"});
+        modify_json_payload(
+            &mut json,
+            "completions",
+            &crate::media::MediaConfig::default(),
+            test_overrides(100, false),
+            "http://127.0.0.1:1/v1/completions".to_string(),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(json["max_tokens"], 100);
+    }
+
+    #[tokio::test]
+    async fn completions_explicit_limit_is_not_overwritten() {
+        let mut json =
+            serde_json::json!({"model": "client-model", "prompt": "hello", "max_tokens": 50});
+        modify_json_payload(
+            &mut json,
+            "completions",
+            &crate::media::MediaConfig::default(),
+            test_overrides(100, true),
+            "http://127.0.0.1:1/v1/completions".to_string(),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(json["max_tokens"], 50);
+    }
+
+    #[test]
+    fn completions_never_counts_input_tokens() {
+        let mut obj = object(serde_json::json!({}));
+        let state = validate_token_limits(&mut obj, &test_overrides(100, true)).unwrap();
+        assert!(state.no_limit);
+        assert!(!should_count_input_tokens(
+            "completions",
+            &state,
+            true,
+            false
+        ));
+
+        let mut obj = object(serde_json::json!({"max_tokens": 500}));
+        let state = validate_token_limits(&mut obj, &test_overrides(100, true)).unwrap();
+        assert!(state.limit_exceed);
+        assert!(!should_count_input_tokens(
+            "completions",
+            &state,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn chat_counts_when_limit_missing_or_exceeded() {
+        let mut obj = object(serde_json::json!({}));
+        let state = validate_token_limits(&mut obj, &test_overrides(100, true)).unwrap();
+        assert!(should_count_input_tokens(
+            "chat/completions",
+            &state,
+            true,
+            true
+        ));
+
+        let mut obj = object(serde_json::json!({"max_tokens": 500}));
+        let state = validate_token_limits(&mut obj, &test_overrides(100, true)).unwrap();
+        assert!(should_count_input_tokens(
+            "chat/completions",
+            &state,
+            true,
+            true
+        ));
+        assert!(!should_count_input_tokens(
+            "chat/completions",
+            &state,
+            true,
+            false
+        ));
+        assert!(!should_count_input_tokens(
+            "chat/completions",
+            &state,
+            false,
+            true
+        ));
     }
 }
