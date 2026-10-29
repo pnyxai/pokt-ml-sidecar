@@ -36,7 +36,7 @@ The main features of this app are:
 
 ### Engine roles
 
-Configure `engine.role` as `chat`, `embedding`, or `reranker`:
+Configure `engine.role` as `chat`, `embedding`, or `reranker`. The `engine` block and its `role` field are mandatory; the sidecar fails at startup if either is missing:
 
 | Role | Allowed `/v1` endpoints |
 |------|--------------------------|
@@ -49,7 +49,7 @@ Anything else under `/v1`, including `/v1/responses`, `/v1/messages`, `*/render`
 
 ### Media inputs
 
-Media is rejected by default. Set `media.limit_mm_per_prompt` to the same values used by the engine's `--limit-mm-per-prompt` configuration:
+Media is rejected by default. The `media` block is mandatory when `engine.role` is `chat` (the sidecar fails at startup without it) and may be omitted for other roles. Set `media.limit_mm_per_prompt` to the same values used by the engine's `--limit-mm-per-prompt` configuration:
 
 ```yaml
 media:

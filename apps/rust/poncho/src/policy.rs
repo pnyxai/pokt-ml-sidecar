@@ -3,10 +3,9 @@ use serde::{Deserialize, Serialize};
 
 /// The role of the engine behind this sidecar. Each role only exposes the
 /// endpoints it is meant to serve.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EngineRole {
-    #[default]
     Chat,
     #[serde(alias = "embeddings")]
     Embedding,

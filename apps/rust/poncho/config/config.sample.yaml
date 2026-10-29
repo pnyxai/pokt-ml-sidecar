@@ -3,14 +3,17 @@ log_level: "debug"
 
 # Which engine this sidecar fronts. Only the endpoints for this role are
 # exposed; every other /v1 path or method returns 404.
+# This block and `role` are mandatory: the sidecar fails to start without them.
 engine:
-  # One of: chat, embedding, reranker
+  # Required. One of: chat, embedding, reranker
   role: chat
   # Legacy /v1/completions is only exposed when explicitly enabled here
   serve_completions: false
 
 # Multimodal media policy. Keep limit_mm_per_prompt in sync with the engine's
 # --limit-mm-per-prompt value. Media is rejected by default until configured.
+# The whole block is mandatory when `engine.role` is `chat`; the sidecar
+# fails to start without it. It may be omitted for other roles.
 media:
   # Whether video_url content parts are accepted
   allow_video: false

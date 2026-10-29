@@ -56,13 +56,20 @@ async fn main() {
     );
     info!("[STARTUP] ");
     info!("[STARTUP] 🖼️  Media Configuration:");
-    info!(
-        "[STARTUP]    Limits per request (image/audio/video): {}/{}/{}",
-        config.media.limit_mm_per_prompt.image,
-        config.media.limit_mm_per_prompt.audio,
-        config.media.limit_mm_per_prompt.video
-    );
-    info!("[STARTUP]    Video Enabled: {}", config.media.allow_video);
+    match &config.media {
+        Some(media) => {
+            info!(
+                "[STARTUP]    Limits per request (image/audio/video): {}/{}/{}",
+                media.limit_mm_per_prompt.image,
+                media.limit_mm_per_prompt.audio,
+                media.limit_mm_per_prompt.video
+            );
+            info!("[STARTUP]    Video Enabled: {}", media.allow_video);
+        }
+        None => {
+            info!("[STARTUP]    No media block (non-chat role: media not applicable)");
+        }
+    }
     info!("[STARTUP] ");
     info!("[STARTUP] 🔗 VLLM Backend Configuration:");
     info!("[STARTUP]    Host: {}", config.vllm_backend.host);
@@ -141,7 +148,7 @@ async fn main() {
             model_public_name: config.model_config_data.model_public_name,
         },
         config.engine,
-        config.media,
+        config.media.unwrap_or_default(),
     )
     .await;
 }
