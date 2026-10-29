@@ -4,10 +4,15 @@ use lofty::probe::Probe;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::io::Cursor;
+use webm_iterable::matroska_spec::{Master, MatroskaSpec};
+use webm_iterable::WebmIterator;
 
 const DEFAULT_MAX_ITEM_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_MAX_IMAGE_DIMENSION: u32 = 8192;
 const DEFAULT_MAX_AUDIO_DURATION_SECONDS: f64 = 600.0;
+const DEFAULT_MAX_VIDEO_DIMENSION: u32 = 8192;
+const DEFAULT_MAX_VIDEO_DURATION_SECONDS: f64 = 600.0;
+const WEBM_DEFAULT_TIMESTAMP_SCALE: u64 = 1_000_000;
 
 /// Per-modality item count or byte limits.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
@@ -42,6 +47,15 @@ pub struct MediaConfig {
     /// Maximum accepted audio duration in seconds.
     #[serde(default = "default_max_audio_duration")]
     pub max_audio_duration_seconds: f64,
+    /// Maximum accepted video width in pixels.
+    #[serde(default = "default_max_video_dimension")]
+    pub max_video_width: u32,
+    /// Maximum accepted video height in pixels.
+    #[serde(default = "default_max_video_dimension")]
+    pub max_video_height: u32,
+    /// Maximum accepted video duration in seconds.
+    #[serde(default = "default_max_video_duration")]
+    pub max_video_duration_seconds: f64,
 }
 
 impl Default for MediaConfig {
@@ -53,6 +67,9 @@ impl Default for MediaConfig {
             max_image_width: default_max_image_dimension(),
             max_image_height: default_max_image_dimension(),
             max_audio_duration_seconds: default_max_audio_duration(),
+            max_video_width: default_max_video_dimension(),
+            max_video_height: default_max_video_dimension(),
+            max_video_duration_seconds: default_max_video_duration(),
         }
     }
 }
@@ -71,6 +88,14 @@ fn default_max_image_dimension() -> u32 {
 
 fn default_max_audio_duration() -> f64 {
     DEFAULT_MAX_AUDIO_DURATION_SECONDS
+}
+
+fn default_max_video_dimension() -> u32 {
+    DEFAULT_MAX_VIDEO_DIMENSION
+}
+
+fn default_max_video_duration() -> f64 {
+    DEFAULT_MAX_VIDEO_DURATION_SECONDS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,9 +261,7 @@ pub fn validate_and_sanitize(
                         .ok_or_else(|| "video_url.url must be a string".to_string())?;
 
                     let bytes = decode_data_uri(url, config.max_item_bytes.video)?;
-                    let kind = sniff_media(&bytes)
-                        .filter(|kind| matches!(kind, MediaKind::Mp4 | MediaKind::Webm))
-                        .ok_or_else(|| "unsupported video format".to_string())?;
+                    let kind = validate_video_bytes(&bytes, config)?;
                     video.insert(
                         "url".to_string(),
                         Value::String(encode_data_uri(kind.video_mime(), &bytes)),
@@ -415,6 +438,134 @@ fn validate_audio_bytes(bytes: &[u8], config: &MediaConfig) -> Result<MediaKind,
     }
 
     Ok(kind)
+}
+
+fn validate_video_bytes(bytes: &[u8], config: &MediaConfig) -> Result<MediaKind, String> {
+    let kind = sniff_media(bytes)
+        .filter(|kind| matches!(kind, MediaKind::Mp4 | MediaKind::Webm))
+        .ok_or_else(|| "unsupported video format".to_string())?;
+
+    let (width, height, duration) = match kind {
+        MediaKind::Mp4 => parse_mp4_metadata(bytes)?,
+        MediaKind::Webm => parse_webm_metadata(bytes)?,
+        _ => unreachable!("sniff_media only returns video kinds here"),
+    };
+
+    if width > config.max_video_width as u64 || height > config.max_video_height as u64 {
+        return Err(format!(
+            "video dimensions {}x{} exceed the {}x{} limit",
+            width, height, config.max_video_width, config.max_video_height
+        ));
+    }
+    if duration > config.max_video_duration_seconds {
+        return Err(format!(
+            "video duration {:.3}s exceeds the {}s limit",
+            duration, config.max_video_duration_seconds
+        ));
+    }
+
+    Ok(kind)
+}
+
+/// Returns the largest video-track dimensions and duration in an MP4 container.
+fn parse_mp4_metadata(bytes: &[u8]) -> Result<(u64, u64, f64), String> {
+    let mut cursor = Cursor::new(bytes);
+    let context =
+        mp4parse::read_mp4(&mut cursor).map_err(|_| "unable to parse MP4 metadata".to_string())?;
+
+    let mut video: Option<(u64, u64, f64)> = None;
+
+    for track in context.tracks.iter() {
+        if track.track_type != mp4parse::TrackType::Video {
+            continue;
+        }
+
+        let duration = match (track.duration, track.timescale) {
+            (Some(duration), Some(timescale)) if duration.0 != u64::MAX && timescale.0 > 0 => {
+                duration.0 as f64 / timescale.0 as f64
+            }
+            _ => return Err("video duration is not available".to_string()),
+        };
+        if duration <= 0.0 {
+            return Err("video duration is not available".to_string());
+        }
+
+        let (width, height) = mp4_video_dimensions(track)
+            .ok_or_else(|| "video dimensions are not available".to_string())?;
+
+        video = Some(match video {
+            Some((w, h, d)) => (w.max(width), h.max(height), d.max(duration)),
+            None => (width, height, duration),
+        });
+    }
+
+    video.ok_or_else(|| "video contains no video track".to_string())
+}
+
+fn mp4_video_dimensions(track: &mp4parse::Track) -> Option<(u64, u64)> {
+    let mut dimensions: Option<(u64, u64)> = None;
+
+    if let Some(stsd) = &track.stsd {
+        for entry in stsd.descriptions.iter() {
+            if let mp4parse::SampleEntry::Video(sample) = entry {
+                if sample.width > 0 && sample.height > 0 {
+                    let (width, height) = (sample.width as u64, sample.height as u64);
+                    dimensions = Some(match dimensions {
+                        Some((w, h)) => (w.max(width), h.max(height)),
+                        None => (width, height),
+                    });
+                }
+            }
+        }
+    }
+
+    if dimensions.is_some() {
+        return dimensions;
+    }
+
+    track
+        .tkhd
+        .as_ref()
+        .map(|tkhd| ((tkhd.width >> 16) as u64, (tkhd.height >> 16) as u64))
+        .filter(|(width, height)| *width > 0 && *height > 0)
+}
+
+/// Returns the largest video-track dimensions and duration in a WebM container.
+fn parse_webm_metadata(bytes: &[u8]) -> Result<(u64, u64, f64), String> {
+    let mut cursor = Cursor::new(bytes);
+    let mut duration: Option<f64> = None;
+    let mut timestamp_scale = WEBM_DEFAULT_TIMESTAMP_SCALE;
+    let mut in_video = false;
+    let mut width: Option<u64> = None;
+    let mut height: Option<u64> = None;
+
+    for tag in WebmIterator::new(&mut cursor, &[]) {
+        let tag = tag.map_err(|_| "unable to parse WebM metadata".to_string())?;
+        match tag {
+            MatroskaSpec::TimestampScale(scale) => timestamp_scale = scale,
+            MatroskaSpec::Duration(value) => duration = Some(value),
+            MatroskaSpec::Video(Master::Start) => in_video = true,
+            MatroskaSpec::Video(Master::End) => in_video = false,
+            MatroskaSpec::PixelWidth(value) if in_video => {
+                width = Some(width.map_or(value, |current| current.max(value)));
+            }
+            MatroskaSpec::PixelHeight(value) if in_video => {
+                height = Some(height.map_or(value, |current| current.max(value)));
+            }
+            _ => {}
+        }
+    }
+
+    let duration = duration.ok_or_else(|| "video duration is not available".to_string())?;
+    let duration_seconds = duration * timestamp_scale as f64 / 1_000_000_000.0;
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        return Err("video duration is not available".to_string());
+    }
+
+    let width = width.ok_or_else(|| "video dimensions are not available".to_string())?;
+    let height = height.ok_or_else(|| "video dimensions are not available".to_string())?;
+
+    Ok((width, height, duration_seconds))
 }
 
 #[cfg(test)]
@@ -629,29 +780,90 @@ mod tests {
         assert!(validate_and_sanitize(obj, &config).is_err());
     }
 
-    #[test]
-    fn accepts_video_when_enabled_and_canonicalizes_mime() {
-        let bytes = b"\x00\x00\x00\x18ftypisom";
-        let mut payload = json!({
+    fn video_config() -> MediaConfig {
+        let mut config = config(0, 0);
+        config.allow_video = true;
+        config.limit_mm_per_prompt.video = 1;
+        config
+    }
+
+    fn video_payload(bytes: &[u8]) -> Value {
+        json!({
             "messages": [{
                 "role": "user",
                 "content": [{
                     "type": "video_url",
-                    "video_url": {"url": encode_data_uri("application/pdf", bytes)}
+                    "video_url": {"url": encode_data_uri("application/octet-stream", bytes)}
                 }]
             }]
-        });
-        let obj = payload.as_object_mut().unwrap();
-        let mut config = config(0, 0);
-        config.allow_video = true;
-        config.limit_mm_per_prompt.video = 1;
+        })
+    }
 
-        validate_and_sanitize(obj, &config).unwrap();
+    const TINY_MP4: &[u8] = include_bytes!("../tests/fixtures/tiny.mp4");
+    const TINY_WEBM: &[u8] = include_bytes!("../tests/fixtures/tiny.webm");
 
-        let url = obj["messages"][0]["content"][0]["video_url"]["url"]
-            .as_str()
-            .unwrap();
-        assert!(url.starts_with("data:video/mp4;base64,"));
+    #[test]
+    fn accepts_video_when_enabled_and_canonicalizes_mime() {
+        for (bytes, mime) in [(TINY_MP4, "video/mp4"), (TINY_WEBM, "video/webm")] {
+            let mut payload = video_payload(bytes);
+            let obj = payload.as_object_mut().unwrap();
+
+            validate_and_sanitize(obj, &video_config()).unwrap();
+
+            let url = obj["messages"][0]["content"][0]["video_url"]["url"]
+                .as_str()
+                .unwrap();
+            assert!(url.starts_with(&format!("data:{};base64,", mime)));
+        }
+    }
+
+    #[test]
+    fn enforces_video_dimensions() {
+        for bytes in [TINY_MP4, TINY_WEBM] {
+            let mut payload = video_payload(bytes);
+            let obj = payload.as_object_mut().unwrap();
+            let mut config = video_config();
+            config.max_video_width = 100;
+            assert!(validate_and_sanitize(obj, &config).is_err());
+
+            let mut payload = video_payload(bytes);
+            let obj = payload.as_object_mut().unwrap();
+            let mut config = video_config();
+            config.max_video_height = 100;
+            assert!(validate_and_sanitize(obj, &config).is_err());
+        }
+    }
+
+    #[test]
+    fn enforces_video_duration_limit() {
+        for bytes in [TINY_MP4, TINY_WEBM] {
+            let mut payload = video_payload(bytes);
+            let obj = payload.as_object_mut().unwrap();
+            let mut config = video_config();
+            config.max_video_duration_seconds = 0.5;
+            assert!(validate_and_sanitize(obj, &config).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_video_without_metadata() {
+        for bytes in [
+            b"\x00\x00\x00\x18ftypisom".as_slice(),
+            b"\x1A\x45\xDF\xA3".as_slice(),
+        ] {
+            let mut payload = video_payload(bytes);
+            let obj = payload.as_object_mut().unwrap();
+            assert!(validate_and_sanitize(obj, &video_config()).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_video() {
+        for bytes in [&TINY_MP4[..32], &TINY_WEBM[..32]] {
+            let mut payload = video_payload(bytes);
+            let obj = payload.as_object_mut().unwrap();
+            assert!(validate_and_sanitize(obj, &video_config()).is_err());
+        }
     }
 
     #[test]

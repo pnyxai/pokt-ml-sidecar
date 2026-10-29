@@ -32,6 +32,11 @@ media:
   max_image_height: 8192
   # Maximum audio duration in seconds
   max_audio_duration_seconds: 600
+  # Maximum video dimensions in pixels
+  max_video_width: 8192
+  max_video_height: 8192
+  # Maximum video duration in seconds
+  max_video_duration_seconds: 600
 
 # Configuration of the poncho server
 server:

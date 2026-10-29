@@ -31,7 +31,7 @@ The main features of this app are:
 - **Content-Type independent JSON bodies**: Every `POST` body is parsed as JSON regardless of the inbound `Content-Type`. Empty or malformed bodies return `400`, and only the re-serialized JSON is forwarded upstream.
 - **Generation parameter validation**: `max_tokens` and `max_completion_tokens` must be positive integers and are capped by `model_config_data.max_tokens` (or rejected when `crop_max_tokens` is disabled). `temperature` must be finite and between `0` and `2`; `top_p` must be finite and between `0` and `1`. For `/v1/completions`, `prompt` must be a single string, and a request that omits `max_tokens` gets it set to `model_config_data.max_tokens` directly (no token-counting round-trip).
 - **Strict chat/completions field allowlist**: `/v1/chat/completions` and `/v1/completions` accept only an explicit set of OpenAI-compatible top-level fields; anything else (e.g. `mm_processor_kwargs`, `chat_template_kwargs`, `allowed_token_ids`, `best_of`) is rejected with `400`. `n` must be `1` when present, preventing relay-side GPU multiplication.
-- **Multimodal media validation**: `image_url`, `input_audio`, and optionally `video_url` parts are accepted only as inline base64 data. Declared MIME types are ignored; decoded magic bytes must be PNG/JPEG/WEBP for images, WAV/FLAC/MP3 for audio, and MP4/WebM for video when enabled. Per-item byte limits, per-request counts, image dimensions, and audio duration are enforced. Client-supplied `uuid` fields are stripped (GHSA-p92p).
+- **Multimodal media validation**: `image_url`, `input_audio`, and optionally `video_url` parts are accepted only as inline base64 data. Declared MIME types are ignored; decoded magic bytes must be PNG/JPEG/WEBP for images, WAV/FLAC/MP3 for audio, and MP4/WebM for video when enabled. Per-item byte limits, per-request counts, image dimensions, audio duration, and video dimensions/duration are enforced; video metadata is read from the container without decoding frames, and unparseable or metadata-less video is rejected. Client-supplied `uuid` fields are stripped (GHSA-p92p).
 - **Health check** (`/health`): Probes the backend `/health` endpoint with a 3-second timeout and returns `{"status": "healthy"}` on success.
 
 
@@ -66,6 +66,9 @@ media:
   max_image_width: 8192
   max_image_height: 8192
   max_audio_duration_seconds: 600
+  max_video_width: 8192
+  max_video_height: 8192
+  max_video_duration_seconds: 600
 ```
 
 - Only inline `data:` base64 URIs are accepted; `http:`, `https:`, `file:`, and all other schemes are rejected.
@@ -73,6 +76,7 @@ media:
 - Magic bytes are authoritative; declared MIME types are ignored. EPS, PostScript, PDF, TIFF, and unknown content are rejected.
 - `input_audio` accepts OpenAI's `{ "data": ..., "format": ... }` form or a `data:` URL and is normalized to `data` + detected format.
 - Per-item bytes, per-request item counts, image dimensions, and audio duration are enforced.
+- Video dimensions and duration are read from the MP4/WebM container metadata and enforced. Requests whose metadata is missing or unparseable (e.g. fragmented MP4 or live WebM without a duration) are rejected.
 - `uuid` fields on content parts are removed before forwarding (GHSA-p92p).
 
 
