@@ -506,6 +506,97 @@ fn validate_token_limits(
     })
 }
 
+/// Top-level fields allowed on `/v1/chat/completions`. Anything else is
+/// rejected with a 400, so poncho does not depend on the engine ignoring or
+/// safely handling unknown/experimental parameters.
+const CHAT_COMPLETIONS_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "n",
+    "stream",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "prompt_logprobs",
+    "user",
+    "seed",
+    "response_format",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "modalities",
+    "prediction",
+    "audio",
+    "reasoning_effort",
+    "metadata",
+    "service_tier",
+    "stream_options",
+    "store",
+];
+
+/// Top-level fields allowed on `/v1/completions`.
+const COMPLETIONS_FIELDS: &[&str] = &[
+    "model",
+    "prompt",
+    "suffix",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "n",
+    "stream",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "user",
+    "seed",
+];
+
+/// Rejects any top-level field that is not in the endpoint's explicit allowlist.
+fn validate_allowed_fields(
+    path: &str,
+    obj: &serde_json::Map<String, Value>,
+) -> Result<(), ProxyError> {
+    let allowed = match path {
+        "chat/completions" => CHAT_COMPLETIONS_FIELDS,
+        "completions" => COMPLETIONS_FIELDS,
+        _ => return Ok(()),
+    };
+
+    for key in obj.keys() {
+        if !allowed.iter().any(|&field| field == key) {
+            return Err(ProxyError::Validation(format!(
+                "Unsupported field '{}' for /v1/{}",
+                key, path
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Enforces that `n` is exactly 1 when present.
+fn validate_n(obj: &serde_json::Map<String, Value>) -> Result<(), ProxyError> {
+    if let Some(value) = obj.get("n") {
+        let n = value.as_u64().ok_or_else(|| {
+            ProxyError::Validation("n must be a positive integer".to_string())
+        })?;
+        if n != 1 {
+            return Err(ProxyError::Validation("n must be 1".to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// Validates and rewrites a chat/completions request payload.
 ///
 /// The model name is overridden, disallowed logprobs are rejected, generation
@@ -522,6 +613,9 @@ async fn modify_json_payload(
     let obj = json
         .as_object_mut()
         .ok_or_else(|| ProxyError::Validation("Request body must be a JSON object".to_string()))?;
+
+    validate_allowed_fields(path, obj)?;
+    validate_n(obj)?;
 
     // Model override
     if obj.contains_key("model") {
@@ -1455,5 +1549,110 @@ mod tests {
             apply_rerank_overrides(&mut json, "backend-model", None),
             Err(ProxyError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn chat_completions_rejects_unknown_fields() {
+        let obj = object(serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "mm_processor_kwargs": {},
+            "allowed_token_ids": [1, 2, 3]
+        }));
+        assert!(matches!(
+            validate_allowed_fields("chat/completions", &obj),
+            Err(ProxyError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn chat_completions_accepts_allowed_fields() {
+        let obj = object(serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "max_tokens": 10,
+            "max_completion_tokens": 10,
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "n": 1,
+            "stream": true,
+            "stop": ["stop"],
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "logit_bias": {},
+            "logprobs": false,
+            "top_logprobs": 0,
+            "user": "u",
+            "seed": 42,
+            "response_format": { "type": "json_object" },
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "modalities": ["text"],
+            "prediction": { "content": "x" },
+            "audio": { "voice": "alloy", "format": "pcm16" },
+            "reasoning_effort": "low",
+            "metadata": {},
+            "service_tier": "auto",
+            "stream_options": { "include_usage": true },
+            "store": false
+        }));
+        validate_allowed_fields("chat/completions", &obj).unwrap();
+    }
+
+    #[test]
+    fn completions_rejects_unknown_fields() {
+        let obj = object(serde_json::json!({
+            "model": "m",
+            "prompt": "p",
+            "best_of": 2
+        }));
+        assert!(matches!(
+            validate_allowed_fields("completions", &obj),
+            Err(ProxyError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn completions_accepts_allowed_fields() {
+        let obj = object(serde_json::json!({
+            "model": "m",
+            "prompt": "p",
+            "suffix": "s",
+            "max_tokens": 10,
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "n": 1,
+            "stream": false,
+            "stop": ["stop"],
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "logit_bias": {},
+            "logprobs": false,
+            "top_logprobs": 0,
+            "user": "u",
+            "seed": 42
+        }));
+        validate_allowed_fields("completions", &obj).unwrap();
+    }
+
+    #[test]
+    fn n_must_be_one() {
+        for value in [
+            serde_json::json!({"n": 2}),
+            serde_json::json!({"n": 0}),
+            serde_json::json!({"n": -1}),
+            serde_json::json!({"n": "1"}),
+            serde_json::json!({"n": 1.5}),
+        ] {
+            let obj = object(value.clone());
+            assert!(
+                validate_n(&obj).is_err(),
+                "n should be rejected: {:?}",
+                value
+            );
+        }
+        assert!(validate_n(&object(serde_json::json!({"n": 1}))).is_ok());
+        assert!(validate_n(&object(serde_json::json!({}))).is_ok());
     }
 }
