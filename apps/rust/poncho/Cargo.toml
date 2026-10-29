@@ -1,6 +1,6 @@
 [package]
 name = "poncho"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -15,3 +15,9 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "limit"] }
 log = "0.4"
 env_logger = "0.11"
+percent-encoding = "2"
+base64 = "0.22"
+imagesize = "0.15"
+lofty = "0.25"
+mp4parse = "0.17"
+webm-iterable = "0.7"
